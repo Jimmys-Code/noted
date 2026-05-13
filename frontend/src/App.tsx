@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MarkdownIt from "markdown-it";
 import { motion } from "framer-motion";
 import Sidebar, { COLORS, CursorKey } from "./components/Sidebar";
-import Editor from "./components/Editor";
+import Editor, { EditorHandle } from "./components/Editor";
 import Help from "./components/Help";
 import SyncPill from "./components/SyncPill";
 import { api, Folder, Note, NoteMeta, SyncStatus } from "./api";
@@ -33,27 +33,23 @@ export default function App() {
   const lastGRef = useRef<number>(0);
   const saveTimer = useRef<number | null>(null);
   const editorWrapRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<EditorHandle>(null);
   const titleRef = useRef<HTMLInputElement>(null);
 
   const focusEditor = useCallback((opts?: { insert?: boolean }) => {
     setFocus("editor");
     let tries = 0;
     const tick = () => {
-      const cm = editorWrapRef.current?.querySelector<HTMLElement>(".cm-content");
-      if (cm) {
-        cm.focus();
-        if (opts?.insert && vimMode) {
-          // Synthesize an 'i' keypress so vim drops into insert mode automatically.
-          cm.dispatchEvent(new KeyboardEvent("keydown", {
-            key: "i", code: "KeyI", bubbles: true, cancelable: true,
-          }));
-        }
+      const handle = editorRef.current;
+      if (handle) {
+        if (opts?.insert) handle.enterInsertMode();
+        else handle.focus();
         return;
       }
-      if (++tries < 20) requestAnimationFrame(tick);
+      if (++tries < 30) requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
-  }, [vimMode]);
+  }, []);
 
   const focusTitle = useCallback(() => {
     setFocus("editor");
@@ -496,6 +492,7 @@ export default function App() {
                 />
               ) : (
                 <Editor
+                  ref={editorRef}
                   value={current.body}
                   onChange={(v) => scheduleSave({ body: v })}
                   vimMode={vimMode}

@@ -1,10 +1,15 @@
-import { useEffect, useRef } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers, highlightActiveLine } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { oneDark } from "@codemirror/theme-one-dark";
-import { vim } from "@replit/codemirror-vim";
+import { vim, Vim, getCM } from "@replit/codemirror-vim";
+
+export type EditorHandle = {
+  focus: () => void;
+  enterInsertMode: () => void;
+};
 
 type Props = {
   value: string;
@@ -12,7 +17,10 @@ type Props = {
   vimMode: boolean;
 };
 
-export default function Editor({ value, onChange, vimMode }: Props) {
+const Editor = forwardRef<EditorHandle, Props>(function Editor(
+  { value, onChange, vimMode },
+  ref,
+) {
   const host = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -39,7 +47,7 @@ export default function Editor({ value, onChange, vimMode }: Props) {
           },
           ".cm-gutters": { background: "transparent", border: "none", color: "#444b5c" },
           ".cm-activeLine": { background: "rgba(255,255,255,0.03)" },
-          ".cm-activeLineGutter": { background: "transparent", color: "#7c8cff" },
+          ".cm-activeLineGutter": { background: "transparent", color: "#ff9a3c" },
         }),
         EditorView.updateListener.of((u) => {
           if (u.docChanged) onChangeRef.current(u.state.doc.toString());
@@ -61,5 +69,23 @@ export default function Editor({ value, onChange, vimMode }: Props) {
     }
   }, [value]);
 
+  useImperativeHandle(ref, () => ({
+    focus: () => viewRef.current?.focus(),
+    enterInsertMode: () => {
+      const view = viewRef.current;
+      if (!view) return;
+      view.focus();
+      if (!vimMode) return;
+      try {
+        const cm = getCM(view);
+        if (cm) Vim.handleKey(cm, "i", "user");
+      } catch (e) {
+        console.warn("enterInsertMode failed", e);
+      }
+    },
+  }), [vimMode]);
+
   return <div ref={host} className="editor-host" />;
-}
+});
+
+export default Editor;

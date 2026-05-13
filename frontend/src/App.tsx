@@ -380,16 +380,6 @@ export default function App() {
     return () => window.removeEventListener("keydown", h, true);
   }, [focus, cursor, cursorIdx, flat, openFolders, notes, helpOpen, renaming, createFolder, createNote, currentFolderId, cycleColor, deleteAtCursor, flush, toggleFolder, setCursorAt, focusEditor, focusTitle]);
 
-  // When focus switches to editor, focus the CodeMirror element
-  useEffect(() => {
-    if (focus !== "editor") return;
-    const t = setTimeout(() => {
-      const cm = editorWrapRef.current?.querySelector<HTMLElement>(".cm-content");
-      cm?.focus();
-    }, 50);
-    return () => clearTimeout(t);
-  }, [focus, current?.id, preview]);
-
   const folderColor = useMemo(() => {
     const f = folders.find((x) => x.id === current?.folder_id);
     return f?.color ?? "#7c8cff";

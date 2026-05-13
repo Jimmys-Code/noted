@@ -215,11 +215,13 @@ export default function App() {
     const n = await api.createNote(folderId, "Untitled", "");
     await refreshNotes();
     setOpenFolders((s) => new Set([...s, folderId]));
+    // Hydrate current synchronously from the POST response so the title input
+    // is mounted with "Untitled" before we focus + select it.
+    setCurrent(n);
     setSelectedNote(n.id);
     setCursor({ kind: "note", id: n.id });
-    // UX flow: collapse sidebar + drop user into the title for typing.
     setCollapsed(true);
-    setTimeout(() => focusTitle(), 40);
+    requestAnimationFrame(() => focusTitle());
   }, [refreshNotes, flush, focusTitle]);
 
   const createFolder = useCallback(async () => {

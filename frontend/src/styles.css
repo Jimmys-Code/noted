@@ -162,6 +162,14 @@ body { background: var(--bg); color: var(--fg); overflow: hidden; }
 }
 .help-pill { font-weight: 700; }
 
+.sync-pill { font-family: "JetBrains Mono", monospace; min-width: 78px; }
+.sync-pill.ok   { background: #2a3a2a; border-color: #3d6b3d; color: #9ee79e; }
+.sync-pill.wait { background: #3a3322; border-color: #6b5b2d; color: #ffd66b; }
+.sync-pill.err  { background: #3a2222; border-color: #6b2d2d; color: #ff8a8a; }
+.sync-pill.off  { background: var(--bg-3); color: var(--fg-mute); }
+.sync-pill.wait { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.55; } }
+
 /* Help modal */
 .help-backdrop {
   position: fixed; inset: 0; background: rgba(0,0,0,0.55);

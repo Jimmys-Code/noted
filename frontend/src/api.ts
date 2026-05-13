@@ -1,12 +1,23 @@
 const BASE = "http://127.0.0.1:8765";
 
+// Retry initial fetches while the Python backend is still spawning.
+// We give up retrying after ~10s; transient errors after that bubble up.
+const bootDeadline = Date.now() + 10_000;
+
 async function j<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(BASE + path, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-  });
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  return r.json();
+  while (true) {
+    try {
+      const r = await fetch(BASE + path, {
+        ...init,
+        headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+      });
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json();
+    } catch (e) {
+      if (Date.now() > bootDeadline) throw e;
+      await new Promise((res) => setTimeout(res, 120));
+    }
+  }
 }
 
 export type Folder = { id: number; name: string; color: string; position: number; created_at: number };
@@ -29,4 +40,18 @@ export const api = {
   updateNote: (id: number, patch: Partial<Pick<Note, "title" | "body" | "folder_id">>) =>
     j<Note>(`/notes/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   deleteNote: (id: number) => j<{ ok: true }>(`/notes/${id}`, { method: "DELETE" }),
+
+  syncStatus: () => j<SyncStatus>("/sync/status"),
+  syncNow: () => j<{ ok: true }>("/sync/now", { method: "POST" }),
+};
+
+export type SyncStatus = {
+  enabled: boolean;
+  url: string | null;
+  last_pull_ts: number;
+  last_push_ts: number;
+  last_error: string | null;
+  in_flight: boolean;
+  pending: number;
+  server_ts: number;
 };

@@ -1,40 +1,38 @@
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
+const fs = require("fs");
 const { spawn } = require("child_process");
-const http = require("http");
+const net = require("net");
 
 const PORT = 8765;
-const isDev = !app.isPackaged && process.env.NODE_ENV !== "production";
+const isDev = process.env.NOTED_DEV === "1";
 
 let backend = null;
 let win = null;
 
-function startBackend() {
+function tcpAlive(port) {
+  return new Promise((resolve) => {
+    const s = net.createConnection({ host: "127.0.0.1", port, timeout: 200 }, () => {
+      s.end();
+      resolve(true);
+    });
+    s.on("error", () => resolve(false));
+    s.on("timeout", () => { s.destroy(); resolve(false); });
+  });
+}
+
+async function ensureBackend() {
+  // If something (e.g. systemd user service) already owns the port, do nothing.
+  if (await tcpAlive(PORT)) return;
   const projectRoot = path.join(__dirname, "..", "..");
   const py = path.join(projectRoot, "backend", ".venv", "bin", "python");
   const script = path.join(projectRoot, "backend", "app.py");
   backend = spawn(py, [script], {
     env: { ...process.env, NOTED_PORT: String(PORT) },
-    stdio: "inherit",
+    stdio: "ignore",
+    detached: false,
   });
   backend.on("exit", (code) => console.log("backend exit", code));
-}
-
-function waitForBackend(retries = 50) {
-  return new Promise((resolve, reject) => {
-    const tick = () => {
-      const req = http.get(`http://127.0.0.1:${PORT}/health`, (res) => {
-        if (res.statusCode === 200) return resolve();
-        retry();
-      });
-      req.on("error", retry);
-    };
-    const retry = () => {
-      if (--retries <= 0) return reject(new Error("backend timeout"));
-      setTimeout(tick, 200);
-    };
-    tick();
-  });
 }
 
 function createWindow() {
@@ -48,28 +46,33 @@ function createWindow() {
     icon: path.join(__dirname, "..", "..", "icons", "noted-512.png"),
     titleBarStyle: "hiddenInset",
     autoHideMenuBar: true,
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
+  win.once("ready-to-show", () => win.show());
+
   if (isDev) {
     win.loadURL("http://localhost:5173");
   } else {
-    win.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+    const indexHtml = path.join(__dirname, "..", "dist", "index.html");
+    if (!fs.existsSync(indexHtml)) {
+      // Fallback if user hasn't built yet — point at vite dev server.
+      win.loadURL("http://localhost:5173");
+    } else {
+      win.loadFile(indexHtml);
+    }
   }
 }
 
 ipcMain.handle("backend-port", () => PORT);
 
-app.whenReady().then(async () => {
-  startBackend();
-  try {
-    await waitForBackend();
-  } catch (e) {
-    console.error(e);
-  }
+app.whenReady().then(() => {
+  // Spawn backend in parallel — don't block the window.
+  ensureBackend().catch((e) => console.error("backend spawn:", e));
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

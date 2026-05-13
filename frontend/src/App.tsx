@@ -4,7 +4,8 @@ import { motion } from "framer-motion";
 import Sidebar, { COLORS, CursorKey } from "./components/Sidebar";
 import Editor from "./components/Editor";
 import Help from "./components/Help";
-import { api, Folder, Note, NoteMeta } from "./api";
+import SyncPill from "./components/SyncPill";
+import { api, Folder, Note, NoteMeta, SyncStatus } from "./api";
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true, typographer: true });
 
@@ -27,6 +28,8 @@ export default function App() {
   const [cursor, setCursor] = useState<CursorKey>(null);
   const [renaming, setRenaming] = useState<number | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [syncS, setSyncS] = useState<SyncStatus | null>(null);
+  const lastPullRef = useRef<number>(0);
   const lastGRef = useRef<number>(0);
   const saveTimer = useRef<number | null>(null);
   const editorWrapRef = useRef<HTMLDivElement>(null);
@@ -134,6 +137,30 @@ export default function App() {
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => { void doSave(); }, 350);
   }, [current, doSave]);
+
+  // Poll sync status; refresh data when a remote pull lands
+  useEffect(() => {
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const s = await api.syncStatus();
+        if (stopped) return;
+        setSyncS(s);
+        if (s.last_pull_ts && s.last_pull_ts !== lastPullRef.current) {
+          lastPullRef.current = s.last_pull_ts;
+          // Pull brought (possibly) new data — refresh views
+          refreshFolders();
+          refreshNotes();
+          if (selectedNote != null) {
+            api.note(selectedNote).then((n) => setCurrent(n)).catch(() => {});
+          }
+        }
+      } catch {}
+    };
+    tick();
+    const id = window.setInterval(tick, 4000);
+    return () => { stopped = true; window.clearInterval(id); };
+  }, [refreshFolders, refreshNotes, selectedNote]);
 
   // Save on window unload
   useEffect(() => {
@@ -390,6 +417,7 @@ export default function App() {
             <span className="title-placeholder">No note selected — Ctrl+N to create one</span>
           )}
           <div className="toolbar">
+            <SyncPill status={syncS} />
             <button
               className={`pill ${vimMode ? "on" : ""}`}
               onClick={() => setVimMode((v) => !v)}

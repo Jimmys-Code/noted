@@ -1,0 +1,17 @@
+[Unit]
+Description=noted sync server (single-user notes sync over HTTP)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/noted-sync
+Environment=NOTED_SYNC_TOKEN=CHANGE_ME_BEFORE_ENABLING
+Environment=NOTED_SYNC_HOST=127.0.0.1
+Environment=NOTED_SYNC_PORT=8770
+Environment=NOTED_SYNC_DB=/opt/noted-sync/data/noted_sync.db
+ExecStart=/opt/noted-sync/venv/bin/python -m noted_sync
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -35,16 +35,25 @@ export default function App() {
   const editorWrapRef = useRef<HTMLDivElement>(null);
   const titleRef = useRef<HTMLInputElement>(null);
 
-  const focusEditor = useCallback(() => {
+  const focusEditor = useCallback((opts?: { insert?: boolean }) => {
     setFocus("editor");
     let tries = 0;
     const tick = () => {
       const cm = editorWrapRef.current?.querySelector<HTMLElement>(".cm-content");
-      if (cm) { cm.focus(); return; }
+      if (cm) {
+        cm.focus();
+        if (opts?.insert && vimMode) {
+          // Synthesize an 'i' keypress so vim drops into insert mode automatically.
+          cm.dispatchEvent(new KeyboardEvent("keydown", {
+            key: "i", code: "KeyI", bubbles: true, cancelable: true,
+          }));
+        }
+        return;
+      }
       if (++tries < 20) requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
-  }, []);
+  }, [vimMode]);
 
   const focusTitle = useCallback(() => {
     setFocus("editor");
@@ -63,9 +72,31 @@ export default function App() {
   useEffect(() => {
     (async () => {
       await refreshFolders();
-      await refreshNotes();
+      const notes = await api.notes();
+      setNotes(notes);
+      // Resume last note if it still exists
+      const last = parseInt(localStorage.getItem("noted.lastNoteId") || "", 10);
+      if (Number.isFinite(last) && notes.some((n) => n.id === last)) {
+        setSelectedNote(last);
+      }
     })();
-  }, [refreshFolders, refreshNotes]);
+  }, [refreshFolders]);
+
+  // Persist last selected note
+  useEffect(() => {
+    if (selectedNote != null) {
+      localStorage.setItem("noted.lastNoteId", String(selectedNote));
+    }
+  }, [selectedNote]);
+
+  // Persist sidebar collapsed state
+  useEffect(() => {
+    const v = localStorage.getItem("noted.sidebarCollapsed");
+    if (v === "1") setCollapsed(true);
+  }, []);
+  useEffect(() => {
+    localStorage.setItem("noted.sidebarCollapsed", collapsed ? "1" : "0");
+  }, [collapsed]);
 
   useEffect(() => {
     if (folders.length && !cursor) {
@@ -180,12 +211,16 @@ export default function App() {
 
   const createNote = useCallback(async (folderId: number | null) => {
     if (folderId == null) return;
-    const n = await api.createNote(folderId, "Untitled", "# Untitled\n\n");
+    flush();
+    const n = await api.createNote(folderId, "Untitled", "");
     await refreshNotes();
     setOpenFolders((s) => new Set([...s, folderId]));
     setSelectedNote(n.id);
     setCursor({ kind: "note", id: n.id });
-  }, [refreshNotes]);
+    // UX flow: collapse sidebar + drop user into the title for typing.
+    setCollapsed(true);
+    setTimeout(() => focusTitle(), 40);
+  }, [refreshNotes, flush, focusTitle]);
 
   const createFolder = useCallback(async () => {
     const name = prompt("Folder name");
@@ -253,21 +288,22 @@ export default function App() {
       const inEditor = isInEditor(e.target);
       const editing = renaming != null || (isEditable(e.target) && !inEditor);
 
-      // GLOBAL app shortcuts — these always win, even inside vim
+      // GLOBAL app shortcuts — these always win, even inside vim (handler runs in capture phase)
       const ctrl = e.ctrlKey || e.metaKey;
+      const stop = () => { e.preventDefault(); e.stopPropagation(); (e as any).stopImmediatePropagation?.(); };
       if (!editing) {
-        if (ctrl && e.key.toLowerCase() === "b") { e.preventDefault(); setCollapsed((c) => !c); return; }
-        if (ctrl && e.key === "1") { e.preventDefault(); setFocus("sidebar"); (document.activeElement as HTMLElement)?.blur?.(); return; }
-        if (ctrl && e.key === "2") { e.preventDefault(); focusEditor(); return; }
-        if (ctrl && e.key.toLowerCase() === "t") { e.preventDefault(); focusTitle(); return; }
-        if (ctrl && e.key.toLowerCase() === "s") { e.preventDefault(); flush(); return; }
-        if (ctrl && e.shiftKey && e.key.toLowerCase() === "n") { e.preventDefault(); createFolder(); return; }
+        if (ctrl && !e.shiftKey && e.key.toLowerCase() === "b") { stop(); setCollapsed((c) => !c); return; }
+        if (ctrl && e.key === "1") { stop(); focusEditor(); return; }
+        if (ctrl && !e.shiftKey && e.key.toLowerCase() === "e") { stop(); setCollapsed(false); setFocus("sidebar"); (document.activeElement as HTMLElement)?.blur?.(); return; }
+        if (ctrl && e.key.toLowerCase() === "t") { stop(); focusTitle(); return; }
+        if (ctrl && e.key.toLowerCase() === "s") { stop(); flush(); return; }
+        if (ctrl && e.shiftKey && e.key.toLowerCase() === "n") { stop(); createFolder(); return; }
+        if (ctrl && e.shiftKey && e.key.toLowerCase() === "p") { stop(); setPreview((p) => !p); return; }
+        if (ctrl && !e.shiftKey && e.key.toLowerCase() === "n") { stop(); createNote(currentFolderId()); return; }
 
-        // Shortcuts that must NOT fire while the editor is focused (they conflict with vim)
+        // Skip help shortcut in editor so vim's ? (search backward) keeps working
         if (!inEditor) {
-          if (ctrl && !e.shiftKey && e.key.toLowerCase() === "n") { e.preventDefault(); createNote(currentFolderId()); return; }
-          if (ctrl && e.key.toLowerCase() === "e") { e.preventDefault(); setPreview((p) => !p); return; }
-          if (e.key === "?" || (e.shiftKey && e.key === "/")) { e.preventDefault(); setHelpOpen((o) => !o); return; }
+          if (e.key === "?" || (e.shiftKey && e.key === "/")) { stop(); setHelpOpen((o) => !o); return; }
         }
       }
 
@@ -342,8 +378,8 @@ export default function App() {
         }
       }
     };
-    window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
+    window.addEventListener("keydown", h, true);
+    return () => window.removeEventListener("keydown", h, true);
   }, [focus, cursor, cursorIdx, flat, openFolders, notes, helpOpen, renaming, createFolder, createNote, currentFolderId, cycleColor, deleteAtCursor, flush, toggleFolder, setCursorAt, focusEditor, focusTitle]);
 
   // When focus switches to editor, focus the CodeMirror element
@@ -408,7 +444,7 @@ export default function App() {
               value={current.title}
               onChange={(e) => scheduleSave({ title: e.target.value })}
               onKeyDown={(e) => {
-                if (e.key === "Enter") { e.preventDefault(); focusEditor(); }
+                if (e.key === "Enter") { e.preventDefault(); focusEditor({ insert: true }); }
                 if (e.key === "Escape") { e.preventDefault(); (e.target as HTMLInputElement).blur(); }
               }}
               style={{ borderLeft: `3px solid ${folderColor}` }}

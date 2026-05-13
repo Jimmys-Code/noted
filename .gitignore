@@ -1,0 +1,9 @@
+node_modules/
+dist/
+dist-electron/
+.venv/
+__pycache__/
+*.pyc
+*.db
+.DS_Store
+.vite/

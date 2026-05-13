@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, screen } = require("electron");
+const { app, BrowserWindow, Menu, ipcMain, screen } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -119,6 +119,8 @@ function createWindow() {
 ipcMain.handle("backend-port", () => PORT);
 
 app.whenReady().then(() => {
+  // Strip the default app menu so its built-in accelerators can't swallow our shortcuts.
+  Menu.setApplicationMenu(null);
   // Spawn backend in parallel — don't block the window.
   ensureBackend().catch((e) => console.error("backend spawn:", e));
   createWindow();

@@ -22,7 +22,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 DB_PATH = Path(os.environ.get("NOTED_SYNC_DB", "/opt/noted-sync/data/noted_sync.db"))
@@ -70,6 +71,17 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at);
 CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder_uuid);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    uuid          TEXT PRIMARY KEY,
+    sha256        TEXT NOT NULL UNIQUE,
+    filename      TEXT NOT NULL,
+    mime          TEXT NOT NULL DEFAULT 'application/octet-stream',
+    size          INTEGER NOT NULL,
+    uploaded_at   INTEGER NOT NULL,
+    data          BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_sha ON attachments(sha256);
 """
 
 
@@ -252,25 +264,159 @@ def state():
     }
 
 
-# --- Optional: search endpoint for agent-comms / RAG hookup (Phase 2 stub) ---
-# This is intentionally minimal — a simple substring scan across non-tombstoned notes.
-# FTS5 / embeddings can come later if recall/perf becomes an issue.
+# --- Attachments — binary blobs (images, etc) referenced from notes ---
+# Auth model: upload + meta require the bearer token; raw is PUBLIC so markdown
+# <img src="..."> tags render without an Authorization header. The UUID (32 hex
+# chars) is the security: unguessable + the threat model is single-user-fleet.
 
-@app.get("/sync/search", dependencies=[auth])
-def search(q: str = Query(..., min_length=1, max_length=200), limit: int = Query(20, ge=1, le=100)):
-    """Substring search across alive notes (title + body, case-insensitive).
-    Returns matches with a 200-char snippet around the first hit. For agents
-    that want to RAG against the user's notes."""
-    needle = q.lower()
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB — nginx vhost has 20 MB cap; raise both if needed
+
+
+@app.post("/attachments", dependencies=[auth])
+async def upload_attachment(file: UploadFile = File(...)):
+    import hashlib
+    import uuid as _uuid
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "empty file")
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(413, f"file too large ({len(data)} > {MAX_ATTACHMENT_BYTES})")
+    sha = hashlib.sha256(data).hexdigest()
+    fname = os.path.basename(file.filename or "attachment")
+    fname = "".join(c if c.isprintable() and c not in '/\\' else "_" for c in fname)[:200] or "attachment"
+    mime = file.content_type or "application/octet-stream"
+    with db() as c:
+        existing = c.execute("SELECT * FROM attachments WHERE sha256=?", (sha,)).fetchone()
+        if existing:
+            return {
+                "uuid": existing["uuid"], "sha256": existing["sha256"],
+                "filename": existing["filename"], "mime": existing["mime"],
+                "size": existing["size"], "uploaded_at": existing["uploaded_at"],
+                "deduped": True,
+            }
+        aid = _uuid.uuid4().hex
+        c.execute(
+            "INSERT INTO attachments (uuid,sha256,filename,mime,size,uploaded_at,data) VALUES (?,?,?,?,?,?,?)",
+            (aid, sha, fname, mime, len(data), now_ms(), data),
+        )
+    return {"uuid": aid, "sha256": sha, "filename": fname, "mime": mime,
+            "size": len(data), "uploaded_at": now_ms(), "deduped": False}
+
+
+@app.get("/attachments/{aid}/meta", dependencies=[auth])
+def attachment_meta(aid: str):
+    with db() as c:
+        r = c.execute(
+            "SELECT uuid,sha256,filename,mime,size,uploaded_at FROM attachments WHERE uuid=?",
+            (aid,),
+        ).fetchone()
+    if not r:
+        raise HTTPException(404, "attachment not found")
+    return dict(r)
+
+
+@app.get("/attachments/{aid}/raw")
+def attachment_raw(aid: str):
+    """Public — no bearer required, so <img src> tags in markdown render directly."""
+    with db() as c:
+        r = c.execute("SELECT mime, filename, data FROM attachments WHERE uuid=?", (aid,)).fetchone()
+    if not r:
+        raise HTTPException(404, "attachment not found")
+    return Response(
+        content=r["data"], media_type=r["mime"],
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+# --- Read endpoints for agent-comms RAG / iOS-bridge consumers ---
+
+@app.get("/sync/note/{nid}", dependencies=[auth])
+def get_note(nid: str):
+    """Single note read by uuid. Returns 404 on missing or tombstoned. Useful for
+    agents that already know a uuid (e.g. from a prior search result) and don't
+    want to fetch the full /sync/changes payload."""
+    with db() as c:
+        r = c.execute("SELECT * FROM notes WHERE uuid=? AND deleted_at IS NULL", (nid,)).fetchone()
+    if not r:
+        raise HTTPException(404, "note not found or deleted")
+    return _row_to_note(r)
+
+
+@app.get("/sync/folder/{fid}", dependencies=[auth])
+def get_folder(fid: str):
+    """Single folder read by uuid."""
+    with db() as c:
+        r = c.execute("SELECT * FROM folders WHERE uuid=? AND deleted_at IS NULL", (fid,)).fetchone()
+    if not r:
+        raise HTTPException(404, "folder not found or deleted")
+    return _row_to_folder(r)
+
+
+@app.get("/sync/folders", dependencies=[auth])
+def list_folders():
+    """All alive folders. Convenience over /sync/changes for clients that just
+    want the folder index (e.g. CLI 'comms notes folders' or iOS folder picker)."""
     with db() as c:
         rows = c.execute(
-            """SELECT n.uuid, n.title, n.body, n.updated_at, f.name AS folder_name
-               FROM notes n LEFT JOIN folders f ON f.uuid = n.folder_uuid
-               WHERE n.deleted_at IS NULL
-                 AND (LOWER(n.title) LIKE ? OR LOWER(n.body) LIKE ?)
-               ORDER BY n.updated_at DESC LIMIT ?""",
-            (f"%{needle}%", f"%{needle}%", limit),
+            "SELECT * FROM folders WHERE deleted_at IS NULL ORDER BY position, name",
         ).fetchall()
+    return [_row_to_folder(r) for r in rows]
+
+
+@app.get("/sync/notes", dependencies=[auth])
+def list_notes(
+    folder: Optional[str] = Query(None, description="folder uuid filter"),
+    since: int = Query(0, ge=0, description="ms epoch; notes updated_at > since"),
+    limit: int = Query(100, ge=1, le=500),
+    body: bool = Query(False, description="include body in response (default: title+meta only)"),
+):
+    """List alive notes with optional folder filter + since cursor. Default skips
+    body for index-style listings; pass body=true to inline content."""
+    q = "SELECT * FROM notes WHERE deleted_at IS NULL"
+    args: list = []
+    if folder is not None:
+        q += " AND folder_uuid=?"
+        args.append(folder)
+    if since:
+        q += " AND updated_at > ?"
+        args.append(since)
+    q += " ORDER BY updated_at DESC LIMIT ?"
+    args.append(limit)
+    with db() as c:
+        rows = c.execute(q, args).fetchall()
+    out = []
+    for r in rows:
+        d = _row_to_note(r)
+        if not body:
+            d.pop("body", None)
+        out.append(d)
+    return out
+
+
+# --- Substring search across alive notes ---
+
+@app.get("/sync/search", dependencies=[auth])
+def search(
+    q: str = Query(..., min_length=1, max_length=200),
+    folder: Optional[str] = Query(None, description="restrict to one folder uuid"),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Substring search across alive notes (title + body, case-insensitive).
+    Returns matches with a 200-char snippet around the first hit. For agents
+    that want to RAG against the user's notes; iOS uses for global search."""
+    needle = q.lower()
+    sql = ("""SELECT n.uuid, n.title, n.body, n.updated_at, f.name AS folder_name, n.folder_uuid
+              FROM notes n LEFT JOIN folders f ON f.uuid = n.folder_uuid
+              WHERE n.deleted_at IS NULL
+                AND (LOWER(n.title) LIKE ? OR LOWER(n.body) LIKE ?)""")
+    args = [f"%{needle}%", f"%{needle}%"]
+    if folder is not None:
+        sql += " AND n.folder_uuid=?"
+        args.append(folder)
+    sql += " ORDER BY n.updated_at DESC LIMIT ?"
+    args.append(limit)
+    with db() as c:
+        rows = c.execute(sql, args).fetchall()
     out = []
     for r in rows:
         body = r["body"] or ""
@@ -281,7 +427,8 @@ def search(q: str = Query(..., min_length=1, max_length=200), limit: int = Query
             start = max(0, idx - 80)
             snippet = ("…" if start > 0 else "") + body[start:start + 200]
         out.append({
-            "uuid": r["uuid"], "title": r["title"], "folder": r["folder_name"],
+            "uuid": r["uuid"], "title": r["title"],
+            "folder": r["folder_name"], "folder_uuid": r["folder_uuid"],
             "updated_at": r["updated_at"], "snippet": snippet,
         })
     return {"q": q, "matches": out}

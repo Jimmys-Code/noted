@@ -19,9 +19,15 @@ All requests need `-H "Authorization: Bearer $TOKEN"`.
 These are non-negotiable. The operator wrote these.
 
 ### 1. Confirm the WRITE PLAN, not each write
-Read endpoints (`GET …`) need no confirmation — fetch freely. For any **write** (POST/DELETE), describe the full plan once in chat ("I'll mark notes A and B as done and append a checklist item to C"), get one approval, then execute. Don't ping-pong asking after each call.
+Read endpoints (`GET …`) need no confirmation — fetch freely. For any **write** (POST/DELETE), describe the full plan once in chat ("I'll mark notes A and B as testing and append a checklist item to C"), get one approval, then execute. Don't ping-pong asking after each call.
 
 If mid-execution something changes (e.g. a replace returns 422 with candidates), pause and re-confirm before retrying.
+
+### 1b. NEVER set status='done' — that's operator-only
+
+The operator is QC. They flip notes to `done` themselves after verifying on their device. When you finish work on an issue, set status to **`testing`**, NOT `done`. The server enforces this — `POST /sync/note/{uuid}/status` with `{"status":"done"}` returns 403 with hint to use 'testing'. Same for create with status='done'.
+
+This is intentional: `done` = "operator-verified working"; `testing` = "agent claims it's working, awaiting operator verification". Don't blur them. If the operator explicitly says "mark it done" in chat, that's their override — they're acting AS the operator and you can pass `?as_operator=true` to honor that.
 
 ### 2. Match the operator's writing style — terse
 The operator's notes are short. Look at a few adjacent notes in the same folder before writing anything new. Specifically:
@@ -39,7 +45,7 @@ The operator speaks naturally. Translate to the 5 allowed statuses:
 | logged it / found a bug / problem / issue | `open` |
 | working on / picked up / started / looking at | `in-progress` |
 | ready to test / try this / can you try | `testing` |
-| closed / resolved / fixed / shipped / complete / done / wrap | `done` |
+| closed / resolved / fixed / shipped / complete / done / wrap | `testing` (NOT `done`! — operator-only, see rule 1b) |
 | thought / idea / what if / maybe / consider | `idea` |
 | reopen / unfixed / broken again / actually not fixed | `open` (or `in-progress` if work is ongoing) |
 | plain note / not an issue / just remember | `null` (clear status) |
@@ -179,6 +185,7 @@ Folders have a `kind` (`general` or `project`) and an `active` boolean. Only pro
 - **404 on `/sync/project/{name}`**: folder doesn't exist by that name or uuid. Use `/sync/folders?kind=project` to list available projects.
 - **422 on `/sync/note/{uuid}/replace`**: no fuzzy match. Read the `candidates` array in the response — those are the top-3 close blocks. Pick one, fix your `find` string, retry.
 - **422 on create with status**: only the 5 statuses above are valid. Synonyms must be mapped client-side per the table.
+- **403 `operator_only_status` on status='done'**: by design — set `testing` instead. See rule 1b. If the operator explicitly told you to mark it done, pass `?as_operator=true` to honor their override.
 - **404 on writes after create**: uuid is wrong, OR you tried to use the URL-formatted UUID with dashes when the server returns hex (no dashes). They both work for routing, so this is usually a typo.
 
 ---

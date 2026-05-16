@@ -876,6 +876,25 @@ def _fetch_note(c, nid: str) -> sqlite3.Row:
     return row
 
 
+def _enforce_done_is_operator_only(new_status: Optional[str], as_operator: bool):
+    """Operator is QA: only the operator may flip a note to status='done'.
+    Agents finishing work must use 'testing' instead — operator verifies on
+    their device and flips to 'done' from there. Enforced on the agent-facing
+    single-call write endpoints (POST /sync/note + /sync/note/{uuid}/status).
+    /sync/push is intentionally left alone since iOS IS the operator's UI."""
+    if new_status == "done" and not as_operator:
+        raise HTTPException(403, detail={
+            "error": "operator_only_status",
+            "message": (
+                "Setting status='done' is reserved for the operator (quality "
+                "control). Use status='testing' instead — operator flips to "
+                "'done' on their device after verifying the fix works."
+            ),
+            "hint": "If you ARE the operator's UI (e.g. iOS app), pass "
+                    "?as_operator=true on the URL.",
+        })
+
+
 class NoteCreateIn(BaseModel):
     folder: Optional[str] = None  # name OR uuid, or null for uncategorized
     title: str = "Untitled"
@@ -884,10 +903,15 @@ class NoteCreateIn(BaseModel):
 
 
 @app.post("/sync/note", dependencies=[auth])
-def create_note(payload: NoteCreateIn):
+def create_note(payload: NoteCreateIn,
+                as_operator: bool = Query(False, description="operator override for status='done' (QC gate)")):
     """Create a new note. Server generates uuid + timestamps and bumps parent
     folder. `folder` accepts a name (case-insensitive) or uuid, or null for
-    uncategorized. Returns the full created note."""
+    uncategorized. Returns the full created note.
+
+    QC gate: status='done' requires ?as_operator=true. Agents finishing work
+    should use status='testing' — operator flips to 'done' after verifying."""
+    _enforce_done_is_operator_only(payload.status, as_operator)
     import uuid as _uuid
     ts = now_ms()
     with db() as c:
@@ -912,9 +936,16 @@ class StatusIn(BaseModel):
 
 
 @app.post("/sync/note/{nid}/status", dependencies=[auth])
-def set_status(nid: str, payload: StatusIn):
+def set_status(nid: str, payload: StatusIn,
+               as_operator: bool = Query(False, description="operator override for status='done' (QC gate)")):
     """Change a note's status in one call. Pass status=null to clear (revert
-    to plain note). Server bumps updated_at + parent folder atomically."""
+    to plain note). Server bumps updated_at + parent folder atomically.
+
+    QC gate: status='done' is reserved for the operator. Agents finishing
+    work should set 'testing' — operator verifies on their device and flips
+    to 'done' from there. Override with ?as_operator=true if you ARE the
+    operator's UI."""
+    _enforce_done_is_operator_only(payload.status, as_operator)
     ts = now_ms()
     with db() as c:
         existing = _fetch_note(c, nid)

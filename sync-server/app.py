@@ -1517,8 +1517,13 @@ def _mark_ai_pending(c, note_uuid: str):
 
 def _ai_worker_pass():
     """One scan iteration. Picks AI_BATCH_SIZE oldest pending rows,
-    processes each, writes results. Exceptions get caught + recorded so
-    worker stays alive."""
+    streams each through OpenRouter. Title + summary land first (progressive
+    reveal — drives iOS's reactive notes list and swipe-left panel).
+    TLDR/keypoints/tags land in one shot at stream end.
+
+    Status transitions per note: pending → streaming → ok (or → failed on
+    error). Each transition bumps updated_at so iOS /sync/changes pulls
+    surface the new fields as they arrive."""
     with db() as c:
         rows = c.execute(
             """SELECT n.uuid, n.title, n.body, n.status, n.folder_uuid, n.ai_attempts,
@@ -1531,7 +1536,7 @@ def _ai_worker_pass():
         ).fetchall()
     for r in rows:
         nid = r["uuid"]
-        # Fetch sibling titles for context
+        # Sibling titles for context (richer titles)
         sib_titles: list[str] = []
         if r["folder_uuid"]:
             with db() as c2:
@@ -1542,31 +1547,67 @@ def _ai_worker_pass():
                     (r["folder_uuid"], nid, _ai.SIBLING_TITLES_COUNT),
                 ).fetchall()
                 sib_titles = [s["title"] for s in sibs if s["title"] and s["title"] != "Untitled"]
+
+        def on_field(field_name: str, value: str, _nid=nid):
+            """Stream callback: title closed or summary closed in the JSON.
+            Update just that field + flip status to 'streaming' + bump
+            updated_at so iOS /sync/changes pulls the partial state."""
+            ts_f = now_ms()
+            col = "ai_title" if field_name == "title" else "ai_summary"
+            with db() as cf:
+                cf.execute(
+                    f"UPDATE notes SET {col}=?, ai_status='streaming', updated_at=? WHERE uuid=?",
+                    (value, ts_f, _nid),
+                )
+                _bump_parent_folder(cf, r["folder_uuid"], ts_f)
+
+        def on_done(meta: dict, _nid=nid):
+            """Stream end: write the rest of the fields atomically + flip
+            status to 'ok'. Final updated_at bump = last visible change."""
+            ts_d = now_ms()
+            with db() as cd:
+                cd.execute(
+                    """UPDATE notes SET
+                           ai_title=?, ai_tags=?, ai_summary=?, ai_tldr=?, ai_keypoints=?,
+                           ai_generated_at=?, ai_model=?, ai_status='ok', ai_error=NULL,
+                           updated_at=?
+                       WHERE uuid=?""",
+                    (meta["title"], json.dumps(meta["tags"]), meta["summary"],
+                     meta["tldr"], json.dumps(meta["key_points"]),
+                     ts_d, meta["model"], ts_d, _nid),
+                )
+                _bump_parent_folder(cd, r["folder_uuid"], ts_d)
+
         try:
-            meta = _ai.generate_for_note(
+            _ai.stream_for_note(
                 note_title=r["title"], body=r["body"] or "",
                 folder_name=r["folder_name"], folder_kind=r["folder_kind"],
                 status=r["status"], sibling_titles=sib_titles,
+                on_field=on_field, on_done=on_done,
             )
         except Exception as e:
+            # If title/summary already landed via on_field, we keep them and
+            # mark 'ok' (partial); otherwise mark failed for retry. Either
+            # way bump the attempt counter.
             with db() as c3:
-                c3.execute(
-                    "UPDATE notes SET ai_attempts=ai_attempts+1, ai_status=?, ai_error=? WHERE uuid=?",
-                    ("failed" if (r["ai_attempts"] + 1) >= AI_MAX_ATTEMPTS else "pending",
-                     str(e)[:500], nid),
-                )
-            continue
-        ts = now_ms()
-        with db() as c4:
-            c4.execute(
-                """UPDATE notes SET
-                       ai_title=?, ai_tags=?, ai_summary=?, ai_tldr=?, ai_keypoints=?,
-                       ai_generated_at=?, ai_model=?, ai_status='ok', ai_error=NULL
-                   WHERE uuid=?""",
-                (meta["title"], json.dumps(meta["tags"]), meta["summary"],
-                 meta["tldr"], json.dumps(meta["key_points"]),
-                 ts, meta["model"], nid),
-            )
+                current = c3.execute(
+                    "SELECT ai_title, ai_summary FROM notes WHERE uuid=?", (nid,),
+                ).fetchone()
+                has_partial = current and (current["ai_title"] or current["ai_summary"])
+                next_attempts = r["ai_attempts"] + 1
+                if has_partial:
+                    # Partial reveal succeeded; treat as ok (no retry)
+                    c3.execute(
+                        "UPDATE notes SET ai_status='ok', ai_error=? WHERE uuid=?",
+                        (f"stream ended early (kept partial): {str(e)[:300]}", nid),
+                    )
+                else:
+                    c3.execute(
+                        "UPDATE notes SET ai_attempts=?, ai_status=?, ai_error=? WHERE uuid=?",
+                        (next_attempts,
+                         "failed" if next_attempts >= AI_MAX_ATTEMPTS else "pending",
+                         str(e)[:500], nid),
+                    )
 
 
 def _ai_worker_loop():

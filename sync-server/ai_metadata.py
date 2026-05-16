@@ -188,6 +188,124 @@ def generate_for_note(note_title: Optional[str], body: str,
     return metadata
 
 
+# --- Streaming generator (progressive title/summary reveal) ---
+# Parses the JSON stream char-by-char and fires callbacks the moment a field
+# CLOSES (closing quote). Title fires first (it's the first key in the prompt
+# schema), then summary, then the final 'done' callback with the full payload
+# parsed from the complete stream.
+#
+# Callback contract:
+#   on_field(field_name, value)  # 'title' or 'summary' with the extracted string
+#   on_done(full_metadata_dict)  # all 5 fields + model after stream completes
+#
+# Robustness: we don't require the model to emit fields in any particular
+# order. We scan the accumulated buffer after each chunk for "<field>": "...".
+# Same field is never re-fired (de-duped by a 'fired' set).
+
+
+# Match a complete JSON string value: "...", allowing escaped quotes.
+# Group 1 = unescaped contents.
+_FIELD_PATTERNS = {
+    "title":   re.compile(r'"title"\s*:\s*"((?:[^"\\]|\\.)*)"'),
+    "summary": re.compile(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"'),
+}
+
+
+def _unescape_json_string(s: str) -> str:
+    """Lightweight JSON string unescape — handles \\n, \\", \\\\, \\t."""
+    return s.replace('\\"', '"').replace('\\n', '\n').replace('\\t', '\t').replace('\\\\', '\\')
+
+
+def _call_openrouter_stream(system: str, user: str, model: str, max_tokens: int = 800,
+                             temperature: float = 0.3, timeout: int = 60):
+    """Generator yielding text deltas as they arrive over OpenRouter SSE."""
+    key = _key()
+    if not key:
+        raise RuntimeError("OPENROUTER_API_KEY not set")
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
+        "reasoning": {"enabled": False, "exclude": True},
+        "stream": True,
+    }
+    req = urllib.request.Request(
+        OPENROUTER_URL, method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "HTTP-Referer": "https://jimmyspianotuning.com.au/noted",
+            "X-Title": "noted-sync metadata worker (stream)",
+        },
+        data=json.dumps(body).encode(),
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        # SSE: "data: {...}\n\n" repeated, ending with "data: [DONE]"
+        buf = ""
+        while True:
+            chunk = r.read(1024)
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", errors="replace")
+            while "\n\n" in buf:
+                event, buf = buf.split("\n\n", 1)
+                for line in event.split("\n"):
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":
+                        return
+                    try:
+                        msg = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = msg.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = (choices[0].get("delta") or {}).get("content")
+                    if delta:
+                        yield delta
+
+
+def stream_for_note(note_title: Optional[str], body: str,
+                    folder_name: Optional[str], folder_kind: Optional[str],
+                    status: Optional[str], sibling_titles: list[str],
+                    on_field, on_done,
+                    model: str = DEFAULT_MODEL) -> None:
+    """Stream variant. Calls on_field('title', value) the moment the title
+    field closes in the JSON stream; same for 'summary'. Then on_done(meta)
+    with the full parsed payload. Raises on transport / parse failure —
+    caller catches and records ai_error."""
+    user_prompt = _build_user_prompt(note_title, body, folder_name, folder_kind, status, sibling_titles)
+    buffer = ""
+    fired: set[str] = set()
+    for delta in _call_openrouter_stream(SYSTEM_PROMPT, user_prompt, model=model):
+        buffer += delta
+        for field, pattern in _FIELD_PATTERNS.items():
+            if field in fired:
+                continue
+            m = pattern.search(buffer)
+            if m:
+                value = _strip_dashes(_unescape_json_string(m.group(1)))
+                fired.add(field)
+                try:
+                    on_field(field, value)
+                except Exception as e:
+                    # Don't let a write hiccup kill the stream; log only
+                    print(f"[ai_stream] on_field({field}) callback raised: {e}", flush=True)
+    # End of stream — parse full payload
+    metadata = _parse_response(buffer)
+    metadata["model"] = model
+    on_done(metadata)
+
+
 def compute_input_hash(body: str, title: Optional[str], folder_name: Optional[str],
                        status: Optional[str]) -> str:
     """Stable hash of the inputs that drive AI generation. Stored on rows so

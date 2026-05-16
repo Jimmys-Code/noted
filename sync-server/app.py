@@ -14,6 +14,7 @@ Auth: single shared bearer token (NOTED_SYNC_TOKEN env var). Single-user.
 """
 from __future__ import annotations
 
+import base64
 import os
 import secrets
 import sqlite3
@@ -31,8 +32,12 @@ from pydantic import BaseModel, Field
 # context; absolute falls back when run from this directory directly.
 try:
     from .fuzzy_edit import str_replace as _fuzzy_str_replace
+    from . import crypto as _crypto
+    from . import github_client as _gh
 except ImportError:
     from fuzzy_edit import str_replace as _fuzzy_str_replace
+    import crypto as _crypto
+    import github_client as _gh
 
 NoteStatus = Literal["idea", "open", "in-progress", "testing", "done"]
 FolderKind = Literal["general", "project"]
@@ -103,6 +108,75 @@ CREATE TABLE IF NOT EXISTS attachments (
     data          BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_sha ON attachments(sha256);
+
+-- --- Git integration tables ---
+-- PATs encrypted with Fernet (see crypto.py). key_version stamps which key
+-- was used so we can rotate without one-shot re-encrypting everything.
+CREATE TABLE IF NOT EXISTS git_credentials (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider          TEXT NOT NULL,           -- 'github' | 'gitlab' | 'github_enterprise'
+    account_label     TEXT NOT NULL DEFAULT 'personal',
+    encrypted_token   BLOB NOT NULL,
+    key_version       INTEGER NOT NULL DEFAULT 1,
+    base_url          TEXT NOT NULL DEFAULT 'https://api.github.com',
+    expires_at        INTEGER,                 -- epoch ms; null = unknown
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+
+-- 1:1 folder → repo link. ON DELETE CASCADE so unlinking on the folder side
+-- (actual row delete; tombstone won't cascade) cleans up the link row.
+CREATE TABLE IF NOT EXISTS folder_git_link (
+    folder_uuid       TEXT PRIMARY KEY REFERENCES folders(uuid) ON DELETE CASCADE,
+    credential_id     INTEGER NOT NULL REFERENCES git_credentials(id) ON DELETE RESTRICT,
+    owner             TEXT NOT NULL,
+    repo              TEXT NOT NULL,
+    default_branch    TEXT NOT NULL DEFAULT 'main',
+    last_synced_at    INTEGER,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_link_cred ON folder_git_link(credential_id);
+
+-- Per-folder tree cache. ETag enables conditional GET — most refreshes are
+-- 304s, costing ~1KB instead of full tree refetch.
+CREATE TABLE IF NOT EXISTS git_tree_cache (
+    folder_uuid       TEXT NOT NULL REFERENCES folders(uuid) ON DELETE CASCADE,
+    branch            TEXT NOT NULL,
+    path              TEXT NOT NULL,
+    sha               TEXT NOT NULL,
+    size              INTEGER,
+    type              TEXT NOT NULL,           -- 'blob' | 'tree'
+    PRIMARY KEY (folder_uuid, branch, path)
+);
+CREATE INDEX IF NOT EXISTS idx_tree_folder_branch ON git_tree_cache(folder_uuid, branch);
+
+-- One row per branch holds the most-recent ETag + fetched_at for the whole
+-- tree, so we can do conditional GET without per-path bookkeeping.
+CREATE TABLE IF NOT EXISTS git_tree_meta (
+    folder_uuid       TEXT NOT NULL REFERENCES folders(uuid) ON DELETE CASCADE,
+    branch            TEXT NOT NULL,
+    etag              TEXT,
+    truncated         INTEGER NOT NULL DEFAULT 0,
+    fetched_at        INTEGER NOT NULL,
+    PRIMARY KEY (folder_uuid, branch)
+);
+
+-- LRU file cache. accessed_at separate from fetched_at so popular files
+-- survive eviction even when they haven't been re-fetched.
+CREATE TABLE IF NOT EXISTS git_file_cache (
+    folder_uuid       TEXT NOT NULL REFERENCES folders(uuid) ON DELETE CASCADE,
+    branch            TEXT NOT NULL,
+    path              TEXT NOT NULL,
+    sha               TEXT NOT NULL,
+    size              INTEGER NOT NULL,
+    content           BLOB NOT NULL,
+    etag              TEXT,
+    fetched_at        INTEGER NOT NULL,
+    accessed_at       INTEGER NOT NULL,
+    PRIMARY KEY (folder_uuid, branch, path)
+);
+CREATE INDEX IF NOT EXISTS idx_file_lru ON git_file_cache(accessed_at);
 """
 
 
@@ -852,6 +926,324 @@ def delete_note(nid: str):
         )
         _bump_parent_folder(c, existing["folder_uuid"], ts)
     return {"ok": True, "uuid": nid, "deleted_at": ts}
+
+
+# --- Git integration endpoints ---
+# Layered model: PAT lives encrypted in git_credentials. folder_git_link
+# attaches a folder→repo. Tree + file caches absorb GitHub round-trips so
+# the agent-facing endpoints stay fast and don't burn rate limit on
+# repeated reads. ETag conditional GET keeps refresh cheap.
+
+TREE_TTL_MS = 5 * 60 * 1000          # under this age: serve cache, skip GitHub round-trip
+FILE_TTL_MS = 5 * 60 * 1000          # under this age: serve cache, no GH refresh
+FILE_CACHE_MAX_BYTES = 100 * 1024 * 1024   # 100 MB total file-cache budget; LRU evicts when exceeded
+
+
+def _get_link(c, folder_uuid: str) -> sqlite3.Row:
+    row = c.execute(
+        "SELECT * FROM folder_git_link WHERE folder_uuid=?", (folder_uuid,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, f"folder not linked to a repo: {folder_uuid}")
+    return row
+
+
+def _get_credential_token(c, credential_id: int) -> tuple[sqlite3.Row, str]:
+    row = c.execute(
+        "SELECT * FROM git_credentials WHERE id=?", (credential_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(500, f"credential {credential_id} missing — link is orphaned")
+    return row, _crypto.decrypt(row["encrypted_token"])
+
+
+def _evict_file_cache_if_over_budget(c):
+    """LRU eviction by accessed_at when total cached bytes exceeds budget."""
+    total = c.execute("SELECT COALESCE(SUM(size),0) FROM git_file_cache").fetchone()[0]
+    if total <= FILE_CACHE_MAX_BYTES:
+        return
+    # Evict oldest-accessed first until under budget
+    over = total - FILE_CACHE_MAX_BYTES
+    rows = c.execute(
+        "SELECT folder_uuid, branch, path, size FROM git_file_cache ORDER BY accessed_at ASC",
+    ).fetchall()
+    freed = 0
+    for r in rows:
+        if freed >= over:
+            break
+        c.execute(
+            "DELETE FROM git_file_cache WHERE folder_uuid=? AND branch=? AND path=?",
+            (r["folder_uuid"], r["branch"], r["path"]),
+        )
+        freed += r["size"]
+
+
+class CredentialIn(BaseModel):
+    provider: Literal["github", "gitlab", "github_enterprise"] = "github"
+    account_label: str = "personal"
+    token: str
+    base_url: str = "https://api.github.com"
+    expires_at: Optional[int] = None
+
+
+@app.post("/git/credentials", dependencies=[auth])
+def save_credential(payload: CredentialIn):
+    """Save a PAT (encrypted at rest via Fernet). Returns the id and a
+    redacted preview — never the plaintext token. Pasting the same token
+    twice creates a second row (no dedup) since labels can differ."""
+    ts = now_ms()
+    enc = _crypto.encrypt(payload.token)
+    with db() as c:
+        cur = c.execute(
+            """INSERT INTO git_credentials
+                 (provider, account_label, encrypted_token, key_version,
+                  base_url, expires_at, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (payload.provider, payload.account_label, enc, _crypto.current_key_version(),
+             payload.base_url, payload.expires_at, ts, ts),
+        )
+        cid = cur.lastrowid
+    return {
+        "id": cid, "provider": payload.provider,
+        "account_label": payload.account_label,
+        "base_url": payload.base_url,
+        "token_preview": payload.token[:10] + "…" + payload.token[-4:],
+        "created_at": ts,
+    }
+
+
+class GitLinkIn(BaseModel):
+    credential_id: int
+    owner: str
+    repo: str
+    default_branch: Optional[str] = None  # if None, server queries GitHub for the repo's default
+
+
+@app.post("/folders/{folder_uuid}/git-link", dependencies=[auth])
+def attach_git_link(folder_uuid: str, payload: GitLinkIn):
+    """Attach a folder to a repo. Idempotent — re-POSTing updates the link.
+    If default_branch is omitted, server queries GitHub once to resolve it."""
+    ts = now_ms()
+    with db() as c:
+        # Verify folder exists + is alive
+        folder = _resolve_folder(c, folder_uuid)
+        cred, token = _get_credential_token(c, payload.credential_id)
+        branch = payload.default_branch
+        if not branch:
+            branch = _gh.resolve_default_branch(payload.owner, payload.repo, token, cred["base_url"])
+            if not branch:
+                raise HTTPException(404, f"could not resolve default branch for {payload.owner}/{payload.repo} — check PAT scope")
+        existing = c.execute(
+            "SELECT folder_uuid FROM folder_git_link WHERE folder_uuid=?", (folder["uuid"],),
+        ).fetchone()
+        if existing:
+            c.execute(
+                """UPDATE folder_git_link SET
+                     credential_id=?, owner=?, repo=?, default_branch=?, updated_at=?
+                   WHERE folder_uuid=?""",
+                (payload.credential_id, payload.owner, payload.repo, branch, ts, folder["uuid"]),
+            )
+        else:
+            c.execute(
+                """INSERT INTO folder_git_link
+                     (folder_uuid, credential_id, owner, repo, default_branch, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (folder["uuid"], payload.credential_id, payload.owner, payload.repo, branch, ts, ts),
+            )
+        link = c.execute(
+            "SELECT * FROM folder_git_link WHERE folder_uuid=?", (folder["uuid"],),
+        ).fetchone()
+    return dict(link)
+
+
+@app.get("/git/folders/{folder_uuid}/link", dependencies=[auth])
+def get_git_link(folder_uuid: str):
+    """Read the folder→repo link metadata. Never exposes the PAT — just the
+    credential_id and repo coordinates. Useful when an agent wants to know
+    'what repo does this project map to' before fetching files."""
+    with db() as c:
+        link = _get_link(c, folder_uuid)
+        cred = c.execute(
+            "SELECT provider, account_label, base_url FROM git_credentials WHERE id=?",
+            (link["credential_id"],),
+        ).fetchone()
+    return {**dict(link), "credential": dict(cred) if cred else None}
+
+
+@app.get("/git/folders/{folder_uuid}/tree", dependencies=[auth])
+def get_tree(folder_uuid: str, branch: Optional[str] = None,
+             prefix: str = Query("", description="path-prefix filter (server-side)"),
+             force: bool = Query(False, description="skip TTL, force GitHub round-trip")):
+    """List tree entries for a linked folder. Defaults to default_branch.
+    Cache strategy:
+      - cache age < 5min and not force → serve cache, no GH call
+      - cache age ≥ 5min OR force      → conditional GET (If-None-Match)
+        - 304 → serve cache, bump fetched_at
+        - 200 → replace cache, store new etag, serve fresh
+      - cache miss → unconditional fetch, store, serve
+
+    prefix='backend/' filters to a subtree without re-fetching."""
+    ts = now_ms()
+    with db() as c:
+        link = _get_link(c, folder_uuid)
+        b = branch or link["default_branch"]
+        meta = c.execute(
+            "SELECT * FROM git_tree_meta WHERE folder_uuid=? AND branch=?",
+            (folder_uuid, b),
+        ).fetchone()
+        need_fetch = force or not meta or (ts - meta["fetched_at"]) >= TREE_TTL_MS
+        if need_fetch:
+            cred, token = _get_credential_token(c, link["credential_id"])
+            status, new_etag, data = _gh.get_tree(
+                link["owner"], link["repo"], b, token,
+                prev_etag=(meta["etag"] if meta else None),
+                base_url=cred["base_url"],
+            )
+            if status == 200:
+                # Replace cache atomically
+                c.execute("DELETE FROM git_tree_cache WHERE folder_uuid=? AND branch=?",
+                          (folder_uuid, b))
+                rows_in = [
+                    (folder_uuid, b, e["path"], e["sha"], e.get("size"), e["type"])
+                    for e in data["tree"]
+                ]
+                c.executemany(
+                    "INSERT INTO git_tree_cache (folder_uuid,branch,path,sha,size,type) VALUES (?,?,?,?,?,?)",
+                    rows_in,
+                )
+                c.execute(
+                    """INSERT INTO git_tree_meta (folder_uuid,branch,etag,truncated,fetched_at)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(folder_uuid,branch) DO UPDATE SET
+                         etag=excluded.etag, truncated=excluded.truncated,
+                         fetched_at=excluded.fetched_at""",
+                    (folder_uuid, b, new_etag, 1 if data.get("truncated") else 0, ts),
+                )
+            elif status == 304:
+                c.execute("UPDATE git_tree_meta SET fetched_at=? WHERE folder_uuid=? AND branch=?",
+                          (ts, folder_uuid, b))
+            elif status in (401, 403):
+                raise HTTPException(status, f"GitHub auth failed for {link['owner']}/{link['repo']} — check PAT scope")
+            elif status == 404:
+                raise HTTPException(404, f"repo or branch not found: {link['owner']}/{link['repo']}@{b}")
+            else:
+                raise HTTPException(502, f"GitHub returned {status}: {data}")
+        # Now read cache (always — even on fetch path, cache was just refreshed)
+        q = "SELECT path, sha, size, type FROM git_tree_cache WHERE folder_uuid=? AND branch=?"
+        a: list = [folder_uuid, b]
+        if prefix:
+            q += " AND path LIKE ?"
+            a.append(prefix + "%")
+        q += " ORDER BY path"
+        rows = c.execute(q, a).fetchall()
+        meta_now = c.execute(
+            "SELECT etag, truncated, fetched_at FROM git_tree_meta WHERE folder_uuid=? AND branch=?",
+            (folder_uuid, b),
+        ).fetchone()
+    return {
+        "owner": link["owner"], "repo": link["repo"], "branch": b,
+        "prefix": prefix,
+        "fetched_at": meta_now["fetched_at"] if meta_now else None,
+        "etag": meta_now["etag"] if meta_now else None,
+        "truncated": bool(meta_now["truncated"]) if meta_now else False,
+        "entries": [dict(r) for r in rows],
+    }
+
+
+@app.get("/git/folders/{folder_uuid}/file", dependencies=[auth])
+def get_file(folder_uuid: str, path: str = Query(..., min_length=1),
+             branch: Optional[str] = None,
+             force: bool = Query(False)):
+    """Fetch a single file's contents. Cache + ETag identical to /tree.
+    Response inlines content as UTF-8 string if decodable, otherwise base64."""
+    ts = now_ms()
+    with db() as c:
+        link = _get_link(c, folder_uuid)
+        b = branch or link["default_branch"]
+        cached = c.execute(
+            "SELECT * FROM git_file_cache WHERE folder_uuid=? AND branch=? AND path=?",
+            (folder_uuid, b, path),
+        ).fetchone()
+        need_fetch = force or not cached or (ts - cached["fetched_at"]) >= FILE_TTL_MS
+        if need_fetch:
+            cred, token = _get_credential_token(c, link["credential_id"])
+            status, new_etag, data = _gh.get_file(
+                link["owner"], link["repo"], b, path, token,
+                prev_etag=(cached["etag"] if cached else None),
+                base_url=cred["base_url"],
+            )
+            if status == 200:
+                content_bytes = _gh.decode_content_base64(data)
+                c.execute(
+                    """INSERT INTO git_file_cache
+                         (folder_uuid,branch,path,sha,size,content,etag,fetched_at,accessed_at)
+                       VALUES (?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(folder_uuid,branch,path) DO UPDATE SET
+                         sha=excluded.sha, size=excluded.size, content=excluded.content,
+                         etag=excluded.etag, fetched_at=excluded.fetched_at,
+                         accessed_at=excluded.accessed_at""",
+                    (folder_uuid, b, path, data["sha"], len(content_bytes), content_bytes,
+                     new_etag, ts, ts),
+                )
+                _evict_file_cache_if_over_budget(c)
+                cached = c.execute(
+                    "SELECT * FROM git_file_cache WHERE folder_uuid=? AND branch=? AND path=?",
+                    (folder_uuid, b, path),
+                ).fetchone()
+            elif status == 304:
+                c.execute(
+                    "UPDATE git_file_cache SET fetched_at=?, accessed_at=? WHERE folder_uuid=? AND branch=? AND path=?",
+                    (ts, ts, folder_uuid, b, path),
+                )
+            elif status in (401, 403):
+                raise HTTPException(status, "GitHub auth failed — check PAT scope")
+            elif status == 404:
+                raise HTTPException(404, f"file not found: {path}@{b}")
+            else:
+                raise HTTPException(502, f"GitHub returned {status}: {data}")
+        else:
+            # Cache hit, just bump accessed_at for LRU
+            c.execute(
+                "UPDATE git_file_cache SET accessed_at=? WHERE folder_uuid=? AND branch=? AND path=?",
+                (ts, folder_uuid, b, path),
+            )
+    # Decide encoding for transport
+    raw: bytes = cached["content"]
+    try:
+        body = raw.decode("utf-8")
+        encoding = "utf-8"
+    except UnicodeDecodeError:
+        body = base64.b64encode(raw).decode("ascii")
+        encoding = "base64"
+    return {
+        "path": path, "branch": b,
+        "sha": cached["sha"], "size": cached["size"],
+        "encoding": encoding, "content": body,
+        "fetched_at": cached["fetched_at"],
+        "from_cache": not need_fetch,
+    }
+
+
+@app.get("/git/folders/{folder_uuid}/search", dependencies=[auth])
+def search_tree(folder_uuid: str, q: str = Query(..., min_length=1, max_length=200),
+                branch: Optional[str] = None,
+                limit: int = Query(50, ge=1, le=500)):
+    """Filename substring search against the local tree cache. Sub-50ms
+    typical for trees under 10k entries. Requires the tree to have been
+    fetched at least once (hit /tree first if cold)."""
+    with db() as c:
+        link = _get_link(c, folder_uuid)
+        b = branch or link["default_branch"]
+        rows = c.execute(
+            """SELECT path, sha, size, type FROM git_tree_cache
+                WHERE folder_uuid=? AND branch=? AND LOWER(path) LIKE ?
+                ORDER BY path LIMIT ?""",
+            (folder_uuid, b, f"%{q.lower()}%", limit),
+        ).fetchall()
+    return {
+        "q": q, "branch": b,
+        "matches": [dict(r) for r in rows],
+    }
 
 
 def run():

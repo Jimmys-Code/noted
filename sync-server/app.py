@@ -26,8 +26,22 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Upload
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+# Two contexts: standalone (`python app.py` in sync-server/) and packaged
+# (`python -m noted_sync` once deployed). Relative import wins in the package
+# context; absolute falls back when run from this directory directly.
+try:
+    from .fuzzy_edit import str_replace as _fuzzy_str_replace
+except ImportError:
+    from fuzzy_edit import str_replace as _fuzzy_str_replace
+
 NoteStatus = Literal["idea", "open", "in-progress", "testing", "done"]
 FolderKind = Literal["general", "project"]
+SortKey = Literal["updated_at", "created_at"]
+
+# Status sets for the project/issues 3-bucket split. ACTIONABLE = "things to
+# do something about right now"; PARKED = "thinking, not yet actionable".
+ACTIONABLE_STATUSES = ("open", "in-progress", "testing")
+PARKED_STATUSES = ("idea",)
 
 DB_PATH = Path(os.environ.get("NOTED_SYNC_DB", "/opt/noted-sync/data/noted_sync.db"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -424,9 +438,12 @@ def get_folder(fid: str):
 def list_folders(
     kind: Optional[FolderKind] = Query(None, description="filter by folder kind"),
     active: Optional[bool] = Query(None, description="filter by active flag (meaningful for kind=project)"),
+    include_recent: int = Query(0, ge=0, le=20, description="if >0, include N most-recent notes per folder"),
 ):
     """All alive folders. Optional `kind` + `active` filters — e.g.
-    /sync/folders?kind=project&active=true returns the iOS sidebar's project list."""
+    /sync/folders?kind=project&active=true returns the iOS sidebar's project list.
+    Pass include_recent=N to enrich each folder with its N most recently updated
+    alive notes (title + status + updated_at, no body) — one round-trip dashboard."""
     q = "SELECT * FROM folders WHERE deleted_at IS NULL"
     args: list = []
     if kind is not None:
@@ -438,7 +455,17 @@ def list_folders(
     q += " ORDER BY position, name"
     with db() as c:
         rows = c.execute(q, args).fetchall()
-    return [_row_to_folder(r) for r in rows]
+        folders = [_row_to_folder(r) for r in rows]
+        if include_recent > 0:
+            for f in folders:
+                recent = c.execute(
+                    """SELECT uuid, title, status, updated_at, created_at
+                         FROM notes WHERE folder_uuid=? AND deleted_at IS NULL
+                         ORDER BY updated_at DESC LIMIT ?""",
+                    (f["uuid"], include_recent),
+                ).fetchall()
+                f["recent_notes"] = [dict(r) for r in recent]
+    return folders
 
 
 @app.get("/sync/notes", dependencies=[auth])
@@ -447,9 +474,11 @@ def list_notes(
     since: int = Query(0, ge=0, description="ms epoch; notes updated_at > since"),
     limit: int = Query(100, ge=1, le=500),
     body: bool = Query(False, description="include body in response (default: title+meta only)"),
+    sort: SortKey = Query("updated_at", description="sort key — updated_at (recently edited) or created_at (recently captured)"),
 ):
     """List alive notes with optional folder filter + since cursor. Default skips
-    body for index-style listings; pass body=true to inline content."""
+    body for index-style listings; pass body=true to inline content. Sort by
+    updated_at (default — "recently edited") or created_at ("recently captured")."""
     q = "SELECT * FROM notes WHERE deleted_at IS NULL"
     args: list = []
     if folder is not None:
@@ -458,7 +487,7 @@ def list_notes(
     if since:
         q += " AND updated_at > ?"
         args.append(since)
-    q += " ORDER BY updated_at DESC LIMIT ?"
+    q += f" ORDER BY {sort} DESC LIMIT ?"
     args.append(limit)
     with db() as c:
         rows = c.execute(q, args).fetchall()
@@ -477,21 +506,30 @@ def list_notes(
 def search(
     q: str = Query(..., min_length=1, max_length=200),
     folder: Optional[str] = Query(None, description="restrict to one folder uuid"),
+    status: Optional[str] = Query(None, description="comma-separated status filter, e.g. 'open,in-progress'"),
     limit: int = Query(20, ge=1, le=100),
+    sort: SortKey = Query("updated_at"),
 ):
     """Substring search across alive notes (title + body, case-insensitive).
-    Returns matches with a 200-char snippet around the first hit. For agents
-    that want to RAG against the user's notes; iOS uses for global search."""
+    Returns matches with a 200-char snippet around the first hit. Optional
+    folder restriction + multi-status filter ('open,in-progress'). Sort by
+    updated_at (default) or created_at."""
     needle = q.lower()
-    sql = ("""SELECT n.uuid, n.title, n.body, n.updated_at, f.name AS folder_name, n.folder_uuid
+    sql = ("""SELECT n.uuid, n.title, n.body, n.status, n.updated_at, n.created_at,
+                     f.name AS folder_name, n.folder_uuid
               FROM notes n LEFT JOIN folders f ON f.uuid = n.folder_uuid
               WHERE n.deleted_at IS NULL
                 AND (LOWER(n.title) LIKE ? OR LOWER(n.body) LIKE ?)""")
-    args = [f"%{needle}%", f"%{needle}%"]
+    args: list = [f"%{needle}%", f"%{needle}%"]
     if folder is not None:
         sql += " AND n.folder_uuid=?"
         args.append(folder)
-    sql += " ORDER BY n.updated_at DESC LIMIT ?"
+    if status:
+        wanted = [s.strip() for s in status.split(",") if s.strip()]
+        if wanted:
+            sql += " AND n.status IN (" + ",".join("?" * len(wanted)) + ")"
+            args.extend(wanted)
+    sql += f" ORDER BY n.{sort} DESC LIMIT ?"
     args.append(limit)
     with db() as c:
         rows = c.execute(sql, args).fetchall()
@@ -505,11 +543,315 @@ def search(
             start = max(0, idx - 80)
             snippet = ("…" if start > 0 else "") + body[start:start + 200]
         out.append({
-            "uuid": r["uuid"], "title": r["title"],
+            "uuid": r["uuid"], "title": r["title"], "status": r["status"],
             "folder": r["folder_name"], "folder_uuid": r["folder_uuid"],
-            "updated_at": r["updated_at"], "snippet": snippet,
+            "updated_at": r["updated_at"], "created_at": r["created_at"],
+            "snippet": snippet,
         })
     return {"q": q, "matches": out}
+
+
+# --- Helpers shared by task-oriented endpoints ---
+
+def _resolve_folder(c, name_or_uuid: str) -> dict:
+    """Look up a folder by exact uuid or case-insensitive name. Raises 404 if
+    not found. Used by /sync/project/{X} so agents can say 'open Focus' or
+    'open the agent-comms project' without knowing the uuid."""
+    # Try uuid first (cheap exact match)
+    row = c.execute(
+        "SELECT * FROM folders WHERE uuid=? AND deleted_at IS NULL",
+        (name_or_uuid,),
+    ).fetchone()
+    if row:
+        return _row_to_folder(row)
+    # Fall back to case-insensitive name
+    row = c.execute(
+        "SELECT * FROM folders WHERE LOWER(name)=LOWER(?) AND deleted_at IS NULL",
+        (name_or_uuid,),
+    ).fetchone()
+    if row:
+        return _row_to_folder(row)
+    raise HTTPException(404, f"folder not found by uuid or name: {name_or_uuid!r}")
+
+
+def _note_summary(r) -> dict:
+    """Compact note dict for list views — no body, includes everything an agent
+    needs to decide whether to fetch the full body."""
+    return {
+        "uuid": r["uuid"], "title": r["title"], "status": r["status"],
+        "folder_uuid": r["folder_uuid"],
+        "created_at": r["created_at"], "updated_at": r["updated_at"],
+    }
+
+
+def _split_buckets(notes: list[dict]) -> dict:
+    """Split a notes list into the 3 agent-friendly buckets used by
+    /sync/project and /sync/issues."""
+    issues = [n for n in notes if n["status"] in ACTIONABLE_STATUSES]
+    ideas = [n for n in notes if n["status"] in PARKED_STATUSES]
+    recent = [n for n in notes if n["status"] not in ACTIONABLE_STATUSES + PARKED_STATUSES]
+    return {"issues": issues, "ideas": ideas, "recent": recent}
+
+
+# --- Task-oriented read endpoints (agent ergonomics) ---
+
+@app.get("/sync/project/{name_or_uuid}", dependencies=[auth])
+def project_view(
+    name_or_uuid: str,
+    recent_limit: int = Query(20, ge=1, le=200, description="cap on recent[] (issues + ideas not capped)"),
+    body: bool = Query(False, description="include full body inline for each note"),
+):
+    """Open a project (or any folder) in one call. Returns 3 buckets:
+      - issues:  status in (open, in-progress, testing) — actionable
+      - ideas:   status == 'idea'                       — parked for later
+      - recent:  everything else (done + plain notes)    — capped by recent_limit
+
+    All buckets sorted by updated_at DESC. Folder name lookup is case-
+    insensitive. Pass body=true to inline note bodies (otherwise titles +
+    meta only — agent fetches /sync/note/{uuid} for full text)."""
+    with db() as c:
+        folder = _resolve_folder(c, name_or_uuid)
+        rows = c.execute(
+            """SELECT * FROM notes WHERE folder_uuid=? AND deleted_at IS NULL
+               ORDER BY updated_at DESC""",
+            (folder["uuid"],),
+        ).fetchall()
+    all_notes = []
+    for r in rows:
+        n = _note_summary(r)
+        if body:
+            n["body"] = r["body"]
+        all_notes.append(n)
+    buckets = _split_buckets(all_notes)
+    buckets["recent"] = buckets["recent"][:recent_limit]
+    return {"folder": folder, **buckets}
+
+
+@app.get("/sync/issues", dependencies=[auth])
+def issues_view(
+    project_only: bool = Query(True, description="if true, restrict to folders with kind='project'"),
+    folder: Optional[str] = Query(None, description="restrict to a single folder uuid"),
+):
+    """Cross-folder issue tracker: all actionable + parked notes grouped by
+    folder. Default scope is just kind='project' folders. Set project_only=false
+    to include general folders too (e.g. open issues in 'Main')."""
+    with db() as c:
+        fq = "SELECT * FROM folders WHERE deleted_at IS NULL"
+        fa: list = []
+        if project_only:
+            fq += " AND kind='project'"
+        if folder is not None:
+            fq += " AND uuid=?"
+            fa.append(folder)
+        fq += " ORDER BY last_activity_at DESC NULLS LAST, position, name"
+        folders = c.execute(fq, fa).fetchall()
+        groups = []
+        total_issues = total_ideas = 0
+        wanted_statuses = ACTIONABLE_STATUSES + PARKED_STATUSES
+        for f in folders:
+            placeholders = ",".join("?" * len(wanted_statuses))
+            rows = c.execute(
+                f"""SELECT * FROM notes WHERE folder_uuid=? AND deleted_at IS NULL
+                    AND status IN ({placeholders})
+                    ORDER BY updated_at DESC""",
+                (f["uuid"], *wanted_statuses),
+            ).fetchall()
+            notes = [_note_summary(r) for r in rows]
+            buckets = _split_buckets(notes)
+            if not buckets["issues"] and not buckets["ideas"]:
+                continue  # skip folders with no actionable work
+            total_issues += len(buckets["issues"])
+            total_ideas += len(buckets["ideas"])
+            groups.append({
+                "folder": _row_to_folder(f),
+                "issues": buckets["issues"],
+                "ideas": buckets["ideas"],
+            })
+    return {
+        "total_issues": total_issues,
+        "total_ideas": total_ideas,
+        "groups": groups,
+    }
+
+
+@app.get("/sync/recent", dependencies=[auth])
+def recent_view(
+    limit: int = Query(20, ge=1, le=100),
+    sort: SortKey = Query("updated_at", description="updated_at = recently edited; created_at = recently captured"),
+    body: bool = Query(False),
+):
+    """Most-recent N notes across ALL alive folders. Each note includes its
+    folder name + status. For 'find my latest note about X', combine with
+    /sync/search?q=X&sort=created_at instead."""
+    with db() as c:
+        rows = c.execute(
+            f"""SELECT n.*, f.name AS folder_name
+                FROM notes n LEFT JOIN folders f ON f.uuid = n.folder_uuid
+                WHERE n.deleted_at IS NULL
+                ORDER BY n.{sort} DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        n = _note_summary(r)
+        n["folder"] = r["folder_name"]
+        if body:
+            n["body"] = r["body"]
+        out.append(n)
+    return {"sort": sort, "limit": limit, "notes": out}
+
+
+# --- Single-call write endpoints (agent ergonomics) ---
+# These replace the read-modify-push dance that /sync/push requires. Server
+# does the bookkeeping atomically: bump updated_at, bump parent folder's
+# last_activity_at + updated_at, return the updated note.
+
+def _bump_parent_folder(c, folder_uuid: Optional[str], ts: int):
+    """Bump parent folder's last_activity_at + updated_at to ts via MAX merge
+    (never goes backwards). No-op for NULL folder_uuid. Same logic as /sync/push."""
+    if folder_uuid:
+        c.execute(
+            """UPDATE folders SET
+                 last_activity_at = MAX(COALESCE(last_activity_at,0), ?),
+                 updated_at       = MAX(updated_at, ?)
+               WHERE uuid = ?""",
+            (ts, ts, folder_uuid),
+        )
+
+
+def _fetch_note(c, nid: str) -> sqlite3.Row:
+    row = c.execute(
+        "SELECT * FROM notes WHERE uuid=? AND deleted_at IS NULL", (nid,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, f"note not found or deleted: {nid}")
+    return row
+
+
+class NoteCreateIn(BaseModel):
+    folder: Optional[str] = None  # name OR uuid, or null for uncategorized
+    title: str = "Untitled"
+    body: str = ""
+    status: Optional[NoteStatus] = None
+
+
+@app.post("/sync/note", dependencies=[auth])
+def create_note(payload: NoteCreateIn):
+    """Create a new note. Server generates uuid + timestamps and bumps parent
+    folder. `folder` accepts a name (case-insensitive) or uuid, or null for
+    uncategorized. Returns the full created note."""
+    import uuid as _uuid
+    ts = now_ms()
+    with db() as c:
+        folder_uuid = None
+        if payload.folder is not None:
+            folder = _resolve_folder(c, payload.folder)
+            folder_uuid = folder["uuid"]
+        nid = _uuid.uuid4().hex
+        c.execute(
+            """INSERT INTO notes (uuid,folder_uuid,title,body,created_at,updated_at,deleted_at,status)
+               VALUES (?,?,?,?,?,?,NULL,?)""",
+            (nid, folder_uuid, payload.title, payload.body, ts, ts, payload.status),
+        )
+        _bump_parent_folder(c, folder_uuid, ts)
+        row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
+    return _row_to_note(row)
+
+
+class StatusIn(BaseModel):
+    status: Optional[NoteStatus]  # required key; null clears status (plain note)
+
+
+@app.post("/sync/note/{nid}/status", dependencies=[auth])
+def set_status(nid: str, payload: StatusIn):
+    """Change a note's status in one call. Pass status=null to clear (revert
+    to plain note). Server bumps updated_at + parent folder atomically."""
+    ts = now_ms()
+    with db() as c:
+        existing = _fetch_note(c, nid)
+        c.execute(
+            "UPDATE notes SET status=?, updated_at=? WHERE uuid=?",
+            (payload.status, ts, nid),
+        )
+        _bump_parent_folder(c, existing["folder_uuid"], ts)
+        row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
+    return _row_to_note(row)
+
+
+class AppendIn(BaseModel):
+    text: str
+
+
+@app.post("/sync/note/{nid}/append", dependencies=[auth])
+def append_to_note(nid: str, payload: AppendIn):
+    """Append text to a note body. Server inserts a newline separator if the
+    existing body is non-empty and doesn't already end in one. Atomic — no
+    read-modify-write needed by the caller."""
+    ts = now_ms()
+    with db() as c:
+        existing = _fetch_note(c, nid)
+        body = existing["body"] or ""
+        sep = "" if (not body or body.endswith("\n")) else "\n"
+        new_body = body + sep + payload.text
+        c.execute(
+            "UPDATE notes SET body=?, updated_at=? WHERE uuid=?",
+            (new_body, ts, nid),
+        )
+        _bump_parent_folder(c, existing["folder_uuid"], ts)
+        row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
+    return _row_to_note(row)
+
+
+class ReplaceIn(BaseModel):
+    find: str
+    replace: str
+
+
+@app.post("/sync/note/{nid}/replace", dependencies=[auth])
+def replace_in_note(nid: str, payload: ReplaceIn):
+    """Find/replace in a note body via 3-layer fuzzy matching (exact →
+    whitespace-normalized → difflib fuzzy at 0.8 threshold).
+
+    On match: 200 with the updated note + `match_type` + `similarity`.
+    On miss:  422 with `candidates` (top-3 close blocks) so the agent can
+              self-correct its `find` string and retry."""
+    ts = now_ms()
+    with db() as c:
+        existing = _fetch_note(c, nid)
+        body = existing["body"] or ""
+        result = _fuzzy_str_replace(body, payload.find, payload.replace)
+        if not result.success:
+            raise HTTPException(422, detail={
+                "error": "no match",
+                "message": result.message,
+                "best_similarity": result.similarity,
+                "candidates": result.candidates or [],
+            })
+        c.execute(
+            "UPDATE notes SET body=?, updated_at=? WHERE uuid=?",
+            (result.new_content, ts, nid),
+        )
+        _bump_parent_folder(c, existing["folder_uuid"], ts)
+        row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
+    out = _row_to_note(row)
+    out["match_type"] = result.match_type
+    out["similarity"] = result.similarity
+    return out
+
+
+@app.delete("/sync/note/{nid}", dependencies=[auth])
+def delete_note(nid: str):
+    """Tombstone a note (sets deleted_at). The row stays in the DB so the
+    delete syncs to other devices via /sync/changes. Parent folder bumps too."""
+    ts = now_ms()
+    with db() as c:
+        existing = _fetch_note(c, nid)
+        c.execute(
+            "UPDATE notes SET deleted_at=?, updated_at=? WHERE uuid=?",
+            (ts, ts, nid),
+        )
+        _bump_parent_folder(c, existing["folder_uuid"], ts)
+    return {"ok": True, "uuid": nid, "deleted_at": ts}
 
 
 def run():

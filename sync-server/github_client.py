@@ -91,3 +91,37 @@ def resolve_default_branch(owner: str, repo: str, token: str,
     if status == 200 and isinstance(payload, dict):
         return payload.get("default_branch")
     return None
+
+
+def list_user_repos(token: str, prev_etag: Optional[str] = None,
+                    sort: str = "pushed", limit: int = 50,
+                    base_url: str = "https://api.github.com",
+                    ) -> tuple[int, Optional[str], Optional[list]]:
+    """List the PAT's accessible repos, sorted by pushed_at desc by default
+    (most recently worked first). limit caps at 100 per the GitHub max."""
+    per_page = min(limit, 100)
+    url = f"{base_url}/user/repos?sort={sort}&direction=desc&per_page={per_page}"
+    return _request("GET", url, token, etag=prev_etag)
+
+
+def list_branches(owner: str, repo: str, token: str,
+                  prev_etag: Optional[str] = None,
+                  base_url: str = "https://api.github.com",
+                  ) -> tuple[int, Optional[str], Optional[list]]:
+    """List branches of a repo (no last_commit_at — that needs a per-branch
+    /commits call enriched by the caller)."""
+    url = f"{base_url}/repos/{owner}/{repo}/branches?per_page=100"
+    return _request("GET", url, token, etag=prev_etag)
+
+
+def get_latest_commit_for_branch(owner: str, repo: str, branch: str, token: str,
+                                  base_url: str = "https://api.github.com",
+                                  ) -> Optional[str]:
+    """Fetch the latest commit on a branch — used to enrich /branches with
+    last_commit_at so the picker can sort 'alive vs dead'. Returns the
+    commit's committer date (ISO) or None on miss."""
+    url = f"{base_url}/repos/{owner}/{repo}/commits?sha={branch}&per_page=1"
+    status, _, data = _request("GET", url, token)
+    if status == 200 and isinstance(data, list) and data:
+        return data[0].get("commit", {}).get("committer", {}).get("date")
+    return None

@@ -15,6 +15,8 @@ Auth: single shared bearer token (NOTED_SYNC_TOKEN env var). Single-user.
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -34,10 +36,12 @@ try:
     from .fuzzy_edit import str_replace as _fuzzy_str_replace
     from . import crypto as _crypto
     from . import github_client as _gh
+    from . import ai_metadata as _ai
 except ImportError:
     from fuzzy_edit import str_replace as _fuzzy_str_replace
     import crypto as _crypto
     import github_client as _gh
+    import ai_metadata as _ai
 
 NoteStatus = Literal["idea", "open", "in-progress", "testing", "done"]
 FolderKind = Literal["general", "project"]
@@ -177,6 +181,39 @@ CREATE TABLE IF NOT EXISTS git_file_cache (
     PRIMARY KEY (folder_uuid, branch, path)
 );
 CREATE INDEX IF NOT EXISTS idx_file_lru ON git_file_cache(accessed_at);
+
+-- Cache for /user/repos (per credential). One row per repo. etag stored on
+-- a meta-row keyed by credential_id alone.
+CREATE TABLE IF NOT EXISTS git_repo_cache (
+    credential_id     INTEGER NOT NULL REFERENCES git_credentials(id) ON DELETE CASCADE,
+    owner             TEXT NOT NULL,
+    repo              TEXT NOT NULL,
+    default_branch    TEXT,
+    pushed_at         TEXT,         -- ISO string from GitHub
+    private           INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (credential_id, owner, repo)
+);
+CREATE TABLE IF NOT EXISTS git_repo_cache_meta (
+    credential_id     INTEGER PRIMARY KEY REFERENCES git_credentials(id) ON DELETE CASCADE,
+    etag              TEXT,
+    fetched_at        INTEGER NOT NULL
+);
+
+-- Cache for branches per folder-link. last_commit_at is enriched by the
+-- server (N+1 /commits call per branch — acceptable for ~30 branches per
+-- repo, runs once per 5min cache window).
+CREATE TABLE IF NOT EXISTS git_branch_cache (
+    folder_uuid       TEXT NOT NULL REFERENCES folders(uuid) ON DELETE CASCADE,
+    name              TEXT NOT NULL,
+    sha               TEXT NOT NULL,
+    last_commit_at    TEXT,
+    PRIMARY KEY (folder_uuid, name)
+);
+CREATE TABLE IF NOT EXISTS git_branch_cache_meta (
+    folder_uuid       TEXT PRIMARY KEY REFERENCES folders(uuid) ON DELETE CASCADE,
+    etag              TEXT,
+    fetched_at        INTEGER NOT NULL
+);
 """
 
 
@@ -209,6 +246,26 @@ def _migrate(c):
 
     if "status" not in ncols:
         c.execute("ALTER TABLE notes ADD COLUMN status TEXT")
+
+    # AI-generated metadata. Worker thread scans for ai_status='pending' rows
+    # and fills these in by calling OpenRouter. Round-tripped via /sync/changes.
+    for col, ddl in [
+        ("ai_title",        "TEXT"),
+        ("ai_tags",         "TEXT"),    # JSON array
+        ("ai_summary",      "TEXT"),    # one sentence
+        ("ai_tldr",         "TEXT"),    # paragraph
+        ("ai_keypoints",    "TEXT"),    # JSON array
+        ("ai_generated_at", "INTEGER"),
+        ("ai_model",        "TEXT"),
+        ("ai_status",       "TEXT"),    # NULL | 'pending' | 'ok' | 'failed' | 'skipped'
+        ("ai_input_hash",   "TEXT"),    # dedup re-gen on no-op writes
+        ("ai_attempts",     "INTEGER NOT NULL DEFAULT 0"),
+        ("ai_error",        "TEXT"),    # last failure reason for diagnostics
+    ]:
+        if col not in ncols:
+            c.execute(f"ALTER TABLE notes ADD COLUMN {col} {ddl}")
+    # Index for the worker scan path
+    c.execute("CREATE INDEX IF NOT EXISTS idx_notes_ai_pending ON notes(ai_status) WHERE ai_status='pending'")
 
 
 init_db()
@@ -291,12 +348,28 @@ def _row_to_folder(r) -> dict:
 
 
 def _row_to_note(r) -> dict:
-    return {
+    keys = r.keys() if hasattr(r, "keys") else []
+    out = {
         "uuid": r["uuid"], "folder_uuid": r["folder_uuid"],
         "title": r["title"], "body": r["body"],
         "created_at": r["created_at"], "updated_at": r["updated_at"],
         "deleted_at": r["deleted_at"], "status": r["status"],
     }
+    # AI metadata — present on every row read post-migration. JSON columns
+    # decoded to native arrays so iOS doesn't double-parse.
+    for k in ("ai_title", "ai_summary", "ai_tldr", "ai_generated_at",
+              "ai_model", "ai_status"):
+        if k in keys:
+            out[k] = r[k]
+    for json_col in ("ai_tags", "ai_keypoints"):
+        if json_col in keys and r[json_col]:
+            try:
+                out[json_col] = json.loads(r[json_col])
+            except (ValueError, TypeError):
+                out[json_col] = None
+        elif json_col in keys:
+            out[json_col] = None
+    return out
 
 
 @app.get("/health")
@@ -396,6 +469,7 @@ def push(payload: PushIn):
                         WHERE uuid = ?""",
                     (n.updated_at, n.updated_at, fuuid),
                 )
+            _mark_ai_pending(c, n.uuid)
     return {
         "accepted_folders": accepted_f, "rejected_folders": rejected_f,
         "accepted_notes": accepted_n, "rejected_notes": rejected_n,
@@ -828,6 +902,7 @@ def create_note(payload: NoteCreateIn):
             (nid, folder_uuid, payload.title, payload.body, ts, ts, payload.status),
         )
         _bump_parent_folder(c, folder_uuid, ts)
+        _mark_ai_pending(c, nid)
         row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
     return _row_to_note(row)
 
@@ -848,6 +923,7 @@ def set_status(nid: str, payload: StatusIn):
             (payload.status, ts, nid),
         )
         _bump_parent_folder(c, existing["folder_uuid"], ts)
+        _mark_ai_pending(c, nid)
         row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
     return _row_to_note(row)
 
@@ -872,6 +948,7 @@ def append_to_note(nid: str, payload: AppendIn):
             (new_body, ts, nid),
         )
         _bump_parent_folder(c, existing["folder_uuid"], ts)
+        _mark_ai_pending(c, nid)
         row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
     return _row_to_note(row)
 
@@ -906,6 +983,7 @@ def replace_in_note(nid: str, payload: ReplaceIn):
             (result.new_content, ts, nid),
         )
         _bump_parent_folder(c, existing["folder_uuid"], ts)
+        _mark_ai_pending(c, nid)
         row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
     out = _row_to_note(row)
     out["match_type"] = result.match_type
@@ -1224,6 +1302,149 @@ def get_file(folder_uuid: str, path: str = Query(..., min_length=1),
     }
 
 
+REPO_LIST_TTL_MS = 5 * 60 * 1000
+BRANCH_LIST_TTL_MS = 5 * 60 * 1000
+
+
+@app.get("/git/credentials/{cid}/repos", dependencies=[auth])
+def list_repos(cid: int,
+               sort: Literal["pushed_desc", "name", "updated_desc"] = Query("pushed_desc"),
+               limit: int = Query(50, ge=1, le=100),
+               force: bool = Query(False)):
+    """List repos accessible to a credential's PAT. Default sort = pushed_at
+    desc so the operator's currently-active repo floats to the top of the
+    picker. Cached for 5min with ETag conditional GET — picker hits are
+    typically warm after the first."""
+    ts = now_ms()
+    with db() as c:
+        cred_row = c.execute("SELECT * FROM git_credentials WHERE id=?", (cid,)).fetchone()
+        if not cred_row:
+            raise HTTPException(404, f"credential {cid} not found")
+        token = _crypto.decrypt(cred_row["encrypted_token"])
+        meta = c.execute("SELECT * FROM git_repo_cache_meta WHERE credential_id=?", (cid,)).fetchone()
+        need_fetch = force or not meta or (ts - meta["fetched_at"]) >= REPO_LIST_TTL_MS
+        if need_fetch:
+            # GitHub's sort=pushed maps directly to our pushed_desc default
+            gh_sort = "pushed" if sort == "pushed_desc" else ("updated" if sort == "updated_desc" else "full_name")
+            status, new_etag, data = _gh.list_user_repos(
+                token, prev_etag=(meta["etag"] if meta else None),
+                sort=gh_sort, limit=limit, base_url=cred_row["base_url"],
+            )
+            if status == 200:
+                c.execute("DELETE FROM git_repo_cache WHERE credential_id=?", (cid,))
+                rows_in = [
+                    (cid, r["owner"]["login"], r["name"], r.get("default_branch"),
+                     r.get("pushed_at"), 1 if r.get("private") else 0)
+                    for r in data
+                ]
+                c.executemany(
+                    "INSERT INTO git_repo_cache (credential_id,owner,repo,default_branch,pushed_at,private) VALUES (?,?,?,?,?,?)",
+                    rows_in,
+                )
+                c.execute(
+                    """INSERT INTO git_repo_cache_meta (credential_id, etag, fetched_at)
+                       VALUES (?,?,?)
+                       ON CONFLICT(credential_id) DO UPDATE SET etag=excluded.etag, fetched_at=excluded.fetched_at""",
+                    (cid, new_etag, ts),
+                )
+            elif status == 304:
+                c.execute("UPDATE git_repo_cache_meta SET fetched_at=? WHERE credential_id=?", (ts, cid))
+            elif status in (401, 403):
+                raise HTTPException(status, "GitHub auth failed — check PAT scope")
+            else:
+                raise HTTPException(502, f"GitHub returned {status}: {data}")
+        # Read cache + sort
+        order_clause = {
+            "pushed_desc":  "pushed_at DESC",
+            "updated_desc": "pushed_at DESC",  # GitHub-side approximation
+            "name":         "owner, repo",
+        }[sort]
+        rows = c.execute(
+            f"SELECT * FROM git_repo_cache WHERE credential_id=? ORDER BY {order_clause} LIMIT ?",
+            (cid, limit),
+        ).fetchall()
+        meta_now = c.execute("SELECT * FROM git_repo_cache_meta WHERE credential_id=?", (cid,)).fetchone()
+    return {
+        "credential_id": cid,
+        "sort": sort,
+        "fetched_at": meta_now["fetched_at"] if meta_now else None,
+        "repos": [
+            {
+                "owner": r["owner"], "repo": r["repo"],
+                "default_branch": r["default_branch"],
+                "pushed_at": r["pushed_at"],
+                "private": bool(r["private"]),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/git/folders/{folder_uuid}/branches", dependencies=[auth])
+def list_branches_endpoint(folder_uuid: str, force: bool = Query(False)):
+    """List branches of the folder's linked repo, sorted by last commit date
+    desc ('alive' branches first). Server enriches each branch with a single
+    /commits call to get committer date — N+1 to GitHub, but cached 5min so
+    the hot path is one local SELECT. Up to ~30 branches per repo handled
+    inline; larger repos would need pagination (not yet)."""
+    ts = now_ms()
+    with db() as c:
+        link = _get_link(c, folder_uuid)
+        meta = c.execute("SELECT * FROM git_branch_cache_meta WHERE folder_uuid=?", (folder_uuid,)).fetchone()
+        need_fetch = force or not meta or (ts - meta["fetched_at"]) >= BRANCH_LIST_TTL_MS
+        if need_fetch:
+            cred, token = _get_credential_token(c, link["credential_id"])
+            status, new_etag, data = _gh.list_branches(
+                link["owner"], link["repo"], token,
+                prev_etag=(meta["etag"] if meta else None),
+                base_url=cred["base_url"],
+            )
+            if status == 200:
+                c.execute("DELETE FROM git_branch_cache WHERE folder_uuid=?", (folder_uuid,))
+                rows_in = []
+                for b in data:
+                    name = b["name"]
+                    sha = b["commit"]["sha"]
+                    # Enrichment: per-branch /commits call for last_commit_at
+                    last_commit_at = _gh.get_latest_commit_for_branch(
+                        link["owner"], link["repo"], name, token, base_url=cred["base_url"],
+                    )
+                    rows_in.append((folder_uuid, name, sha, last_commit_at))
+                c.executemany(
+                    "INSERT INTO git_branch_cache (folder_uuid,name,sha,last_commit_at) VALUES (?,?,?,?)",
+                    rows_in,
+                )
+                c.execute(
+                    """INSERT INTO git_branch_cache_meta (folder_uuid, etag, fetched_at)
+                       VALUES (?,?,?)
+                       ON CONFLICT(folder_uuid) DO UPDATE SET etag=excluded.etag, fetched_at=excluded.fetched_at""",
+                    (folder_uuid, new_etag, ts),
+                )
+            elif status == 304:
+                c.execute("UPDATE git_branch_cache_meta SET fetched_at=? WHERE folder_uuid=?", (ts, folder_uuid))
+            elif status in (401, 403):
+                raise HTTPException(status, "GitHub auth failed — check PAT scope")
+            elif status == 404:
+                raise HTTPException(404, f"repo not found: {link['owner']}/{link['repo']}")
+            else:
+                raise HTTPException(502, f"GitHub returned {status}: {data}")
+        rows = c.execute(
+            """SELECT name, sha, last_commit_at FROM git_branch_cache
+               WHERE folder_uuid=? ORDER BY last_commit_at DESC NULLS LAST, name""",
+            (folder_uuid,),
+        ).fetchall()
+        meta_now = c.execute("SELECT * FROM git_branch_cache_meta WHERE folder_uuid=?", (folder_uuid,)).fetchone()
+    return {
+        "owner": link["owner"], "repo": link["repo"],
+        "default_branch": link["default_branch"],
+        "fetched_at": meta_now["fetched_at"] if meta_now else None,
+        "branches": [
+            {"name": r["name"], "sha": r["sha"], "last_commit_at": r["last_commit_at"]}
+            for r in rows
+        ],
+    }
+
+
 @app.get("/git/folders/{folder_uuid}/search", dependencies=[auth])
 def search_tree(folder_uuid: str, q: str = Query(..., min_length=1, max_length=200),
                 branch: Optional[str] = None,
@@ -1244,6 +1465,142 @@ def search_tree(folder_uuid: str, q: str = Query(..., min_length=1, max_length=2
         "q": q, "branch": b,
         "matches": [dict(r) for r in rows],
     }
+
+
+# --- AI metadata: trigger + background worker ---
+# Trigger: any write endpoint calls _mark_ai_pending(uuid). Sets ai_status=
+# 'pending' unless the input_hash matches the existing hash (no-op write).
+# Worker: a single daemon thread polls for pending rows every AI_POLL_SECONDS
+# and processes up to AI_BATCH_SIZE per pass. Retries failed rows with
+# exponential backoff capped at AI_MAX_BACKOFF_SECONDS.
+
+AI_POLL_SECONDS = float(os.environ.get("AI_POLL_SECONDS", "1.5"))
+AI_BATCH_SIZE = int(os.environ.get("AI_BATCH_SIZE", "3"))
+AI_MAX_ATTEMPTS = int(os.environ.get("AI_MAX_ATTEMPTS", "5"))
+AI_MAX_BACKOFF_SECONDS = int(os.environ.get("AI_MAX_BACKOFF_SECONDS", "300"))
+
+
+def _mark_ai_pending(c, note_uuid: str):
+    """Hook called by every write endpoint after the note row is updated.
+    Recomputes input_hash from current note + folder state. If unchanged
+    (e.g. status-only update with no body change), skips. If body is too
+    short, marks 'skipped' to avoid wasting tokens on stubs. Otherwise
+    marks 'pending' and resets attempts."""
+    r = c.execute(
+        """SELECT n.uuid, n.title, n.body, n.status, n.ai_input_hash, n.deleted_at,
+                  f.name AS folder_name
+             FROM notes n LEFT JOIN folders f ON f.uuid = n.folder_uuid
+            WHERE n.uuid=?""",
+        (note_uuid,),
+    ).fetchone()
+    if not r or r["deleted_at"]:
+        return
+    new_hash = _ai.compute_input_hash(r["body"] or "", r["title"], r["folder_name"], r["status"])
+    if r["ai_input_hash"] == new_hash:
+        return  # no-op write; don't re-burn tokens
+    if len((r["body"] or "").strip()) < _ai.MIN_BODY_CHARS_FOR_AI:
+        # Stub note — clear any previous AI metadata, mark skipped
+        c.execute(
+            """UPDATE notes SET ai_status='skipped', ai_input_hash=?,
+                                ai_title=NULL, ai_tags=NULL, ai_summary=NULL,
+                                ai_tldr=NULL, ai_keypoints=NULL, ai_attempts=0,
+                                ai_error=NULL
+                          WHERE uuid=?""",
+            (new_hash, note_uuid),
+        )
+        return
+    c.execute(
+        "UPDATE notes SET ai_status='pending', ai_input_hash=?, ai_attempts=0, ai_error=NULL WHERE uuid=?",
+        (new_hash, note_uuid),
+    )
+
+
+def _ai_worker_pass():
+    """One scan iteration. Picks AI_BATCH_SIZE oldest pending rows,
+    processes each, writes results. Exceptions get caught + recorded so
+    worker stays alive."""
+    with db() as c:
+        rows = c.execute(
+            """SELECT n.uuid, n.title, n.body, n.status, n.folder_uuid, n.ai_attempts,
+                      f.name AS folder_name, f.kind AS folder_kind
+                 FROM notes n LEFT JOIN folders f ON f.uuid = n.folder_uuid
+                WHERE n.ai_status='pending' AND n.deleted_at IS NULL
+                  AND n.ai_attempts < ?
+             ORDER BY n.updated_at ASC LIMIT ?""",
+            (AI_MAX_ATTEMPTS, AI_BATCH_SIZE),
+        ).fetchall()
+    for r in rows:
+        nid = r["uuid"]
+        # Fetch sibling titles for context
+        sib_titles: list[str] = []
+        if r["folder_uuid"]:
+            with db() as c2:
+                sibs = c2.execute(
+                    """SELECT title FROM notes
+                        WHERE folder_uuid=? AND deleted_at IS NULL AND uuid<>?
+                        ORDER BY updated_at DESC LIMIT ?""",
+                    (r["folder_uuid"], nid, _ai.SIBLING_TITLES_COUNT),
+                ).fetchall()
+                sib_titles = [s["title"] for s in sibs if s["title"] and s["title"] != "Untitled"]
+        try:
+            meta = _ai.generate_for_note(
+                note_title=r["title"], body=r["body"] or "",
+                folder_name=r["folder_name"], folder_kind=r["folder_kind"],
+                status=r["status"], sibling_titles=sib_titles,
+            )
+        except Exception as e:
+            with db() as c3:
+                c3.execute(
+                    "UPDATE notes SET ai_attempts=ai_attempts+1, ai_status=?, ai_error=? WHERE uuid=?",
+                    ("failed" if (r["ai_attempts"] + 1) >= AI_MAX_ATTEMPTS else "pending",
+                     str(e)[:500], nid),
+                )
+            continue
+        ts = now_ms()
+        with db() as c4:
+            c4.execute(
+                """UPDATE notes SET
+                       ai_title=?, ai_tags=?, ai_summary=?, ai_tldr=?, ai_keypoints=?,
+                       ai_generated_at=?, ai_model=?, ai_status='ok', ai_error=NULL
+                   WHERE uuid=?""",
+                (meta["title"], json.dumps(meta["tags"]), meta["summary"],
+                 meta["tldr"], json.dumps(meta["key_points"]),
+                 ts, meta["model"], nid),
+            )
+
+
+def _ai_worker_loop():
+    """Daemon thread. Sleeps AI_POLL_SECONDS between passes. Caught errors
+    don't kill the loop — only an interpreter shutdown should stop it."""
+    import time as _t
+    while True:
+        try:
+            _ai_worker_pass()
+        except Exception as e:
+            print(f"[ai_worker] pass error: {e}", flush=True)
+        _t.sleep(AI_POLL_SECONDS)
+
+
+_ai_worker_started = False
+
+
+def _start_ai_worker():
+    global _ai_worker_started
+    if _ai_worker_started:
+        return
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        print("[ai_worker] OPENROUTER_API_KEY not set; AI metadata disabled", flush=True)
+        return
+    import threading
+    t = threading.Thread(target=_ai_worker_loop, name="ai-metadata-worker", daemon=True)
+    t.start()
+    _ai_worker_started = True
+    print(f"[ai_worker] started (poll={AI_POLL_SECONDS}s, batch={AI_BATCH_SIZE}, model={_ai.DEFAULT_MODEL})", flush=True)
+
+
+@app.on_event("startup")
+def _on_startup():
+    _start_ai_worker()
 
 
 def run():

@@ -20,11 +20,14 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+
+NoteStatus = Literal["idea", "open", "in-progress", "testing", "done"]
+FolderKind = Literal["general", "project"]
 
 DB_PATH = Path(os.environ.get("NOTED_SYNC_DB", "/opt/noted-sync/data/noted_sync.db"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -50,13 +53,16 @@ def db():
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS folders (
-    uuid          TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    color         TEXT NOT NULL DEFAULT '#7c8cff',
-    position      INTEGER NOT NULL DEFAULT 0,
-    created_at    INTEGER NOT NULL,
-    updated_at    INTEGER NOT NULL,
-    deleted_at    INTEGER
+    uuid              TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    color             TEXT NOT NULL DEFAULT '#7c8cff',
+    position          INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    deleted_at        INTEGER,
+    kind              TEXT NOT NULL DEFAULT 'general',
+    active            INTEGER NOT NULL DEFAULT 1,
+    last_activity_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_folders_updated ON folders(updated_at);
 
@@ -67,7 +73,8 @@ CREATE TABLE IF NOT EXISTS notes (
     body          TEXT NOT NULL DEFAULT '',
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL,
-    deleted_at    INTEGER
+    deleted_at    INTEGER,
+    status        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at);
 CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder_uuid);
@@ -88,6 +95,32 @@ CREATE INDEX IF NOT EXISTS idx_attachments_sha ON attachments(sha256);
 def init_db():
     with db() as c:
         c.executescript(SCHEMA)
+        _migrate(c)
+
+
+def _migrate(c):
+    """Idempotent ALTER TABLE migrations for existing DBs. CREATE TABLE IF NOT
+    EXISTS is a no-op once the table exists, so column additions must be ALTERed
+    in explicitly. Safe to run on every boot."""
+    fcols = {r["name"] for r in c.execute("PRAGMA table_info(folders)").fetchall()}
+    ncols = {r["name"] for r in c.execute("PRAGMA table_info(notes)").fetchall()}
+
+    if "kind" not in fcols:
+        c.execute("ALTER TABLE folders ADD COLUMN kind TEXT NOT NULL DEFAULT 'general'")
+    if "active" not in fcols:
+        c.execute("ALTER TABLE folders ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    if "last_activity_at" not in fcols:
+        c.execute("ALTER TABLE folders ADD COLUMN last_activity_at INTEGER")
+        # one-shot backfill so sidebar sorts correctly without waiting for a touch
+        c.execute(
+            """UPDATE folders SET last_activity_at = (
+                 SELECT MAX(updated_at) FROM notes
+                  WHERE folder_uuid = folders.uuid AND deleted_at IS NULL
+               ) WHERE last_activity_at IS NULL"""
+        )
+
+    if "status" not in ncols:
+        c.execute("ALTER TABLE notes ADD COLUMN status TEXT")
 
 
 init_db()
@@ -110,6 +143,11 @@ class FolderIn(BaseModel):
     created_at: int
     updated_at: int
     deleted_at: Optional[int] = None
+    kind: FolderKind = "general"
+    active: bool = True
+    # client-supplied accepted but server-bump on note write is authoritative —
+    # see push() for the MAX() merge that prevents going backwards.
+    last_activity_at: Optional[int] = None
 
 
 class NoteIn(BaseModel):
@@ -120,6 +158,7 @@ class NoteIn(BaseModel):
     created_at: int
     updated_at: int
     deleted_at: Optional[int] = None
+    status: Optional[NoteStatus] = None
 
 
 class FolderOut(FolderIn):
@@ -158,6 +197,8 @@ def _row_to_folder(r) -> dict:
         "uuid": r["uuid"], "name": r["name"], "color": r["color"],
         "position": r["position"], "created_at": r["created_at"],
         "updated_at": r["updated_at"], "deleted_at": r["deleted_at"],
+        "kind": r["kind"], "active": bool(r["active"]),
+        "last_activity_at": r["last_activity_at"],
     }
 
 
@@ -166,7 +207,7 @@ def _row_to_note(r) -> dict:
         "uuid": r["uuid"], "folder_uuid": r["folder_uuid"],
         "title": r["title"], "body": r["body"],
         "created_at": r["created_at"], "updated_at": r["updated_at"],
-        "deleted_at": r["deleted_at"],
+        "deleted_at": r["deleted_at"], "status": r["status"],
     }
 
 
@@ -202,7 +243,13 @@ def get_changes(since: int = Query(0, ge=0, description="ms since epoch; returns
 def push(payload: PushIn):
     """Push: client uploads a batch of local changes. Per record, last-write-wins by
     `updated_at`. On tie, server keeps its version (deterministic). Returns which UUIDs
-    were accepted vs rejected so the client knows what to refresh."""
+    were accepted vs rejected so the client knows what to refresh.
+
+    Side effect on accepted notes: bumps the parent folder's last_activity_at AND
+    updated_at via MAX() so the new value never goes backwards. On a folder move
+    (old folder_uuid != new), bumps BOTH old and new folder. updated_at gets bumped
+    too because that's what /sync/changes uses as the cursor — without it iOS would
+    not pull the new last_activity_at."""
     accepted_f: list[str] = []
     rejected_f: list[str] = []
     accepted_n: list[str] = []
@@ -216,30 +263,51 @@ def push(payload: PushIn):
                 rejected_f.append(f.uuid)
                 continue
             c.execute(
-                """INSERT INTO folders (uuid,name,color,position,created_at,updated_at,deleted_at)
-                   VALUES (?,?,?,?,?,?,?)
+                """INSERT INTO folders (uuid,name,color,position,created_at,updated_at,deleted_at,kind,active,last_activity_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(uuid) DO UPDATE SET
                      name=excluded.name, color=excluded.color, position=excluded.position,
-                     updated_at=excluded.updated_at, deleted_at=excluded.deleted_at""",
-                (f.uuid, f.name, f.color, f.position, f.created_at, f.updated_at, f.deleted_at),
+                     updated_at=excluded.updated_at, deleted_at=excluded.deleted_at,
+                     kind=excluded.kind, active=excluded.active,
+                     last_activity_at=MAX(COALESCE(folders.last_activity_at,0), COALESCE(excluded.last_activity_at,0))""",
+                (f.uuid, f.name, f.color, f.position, f.created_at, f.updated_at, f.deleted_at,
+                 f.kind, 1 if f.active else 0, f.last_activity_at),
             )
             accepted_f.append(f.uuid)
         for n in payload.notes:
             existing = c.execute(
-                "SELECT updated_at FROM notes WHERE uuid=?", (n.uuid,),
+                "SELECT updated_at, folder_uuid FROM notes WHERE uuid=?", (n.uuid,),
             ).fetchone()
             if existing and existing["updated_at"] >= n.updated_at:
                 rejected_n.append(n.uuid)
                 continue
             c.execute(
-                """INSERT INTO notes (uuid,folder_uuid,title,body,created_at,updated_at,deleted_at)
-                   VALUES (?,?,?,?,?,?,?)
+                """INSERT INTO notes (uuid,folder_uuid,title,body,created_at,updated_at,deleted_at,status)
+                   VALUES (?,?,?,?,?,?,?,?)
                    ON CONFLICT(uuid) DO UPDATE SET
                      folder_uuid=excluded.folder_uuid, title=excluded.title, body=excluded.body,
-                     updated_at=excluded.updated_at, deleted_at=excluded.deleted_at""",
-                (n.uuid, n.folder_uuid, n.title, n.body, n.created_at, n.updated_at, n.deleted_at),
+                     updated_at=excluded.updated_at, deleted_at=excluded.deleted_at,
+                     status=excluded.status""",
+                (n.uuid, n.folder_uuid, n.title, n.body, n.created_at, n.updated_at, n.deleted_at, n.status),
             )
             accepted_n.append(n.uuid)
+            # Bump parent folder(s). MAX() merge prevents going backwards if a
+            # folder rename (with newer updated_at) raced ahead of this note write.
+            old_fuuid = existing["folder_uuid"] if existing else None
+            new_fuuid = n.folder_uuid
+            touched: set[str] = set()
+            if new_fuuid:
+                touched.add(new_fuuid)
+            if old_fuuid and old_fuuid != new_fuuid:
+                touched.add(old_fuuid)
+            for fuuid in touched:
+                c.execute(
+                    """UPDATE folders
+                          SET last_activity_at = MAX(COALESCE(last_activity_at,0), ?),
+                              updated_at       = MAX(updated_at, ?)
+                        WHERE uuid = ?""",
+                    (n.updated_at, n.updated_at, fuuid),
+                )
     return {
         "accepted_folders": accepted_f, "rejected_folders": rejected_f,
         "accepted_notes": accepted_n, "rejected_notes": rejected_n,
@@ -353,13 +421,23 @@ def get_folder(fid: str):
 
 
 @app.get("/sync/folders", dependencies=[auth])
-def list_folders():
-    """All alive folders. Convenience over /sync/changes for clients that just
-    want the folder index (e.g. CLI 'comms notes folders' or iOS folder picker)."""
+def list_folders(
+    kind: Optional[FolderKind] = Query(None, description="filter by folder kind"),
+    active: Optional[bool] = Query(None, description="filter by active flag (meaningful for kind=project)"),
+):
+    """All alive folders. Optional `kind` + `active` filters — e.g.
+    /sync/folders?kind=project&active=true returns the iOS sidebar's project list."""
+    q = "SELECT * FROM folders WHERE deleted_at IS NULL"
+    args: list = []
+    if kind is not None:
+        q += " AND kind=?"
+        args.append(kind)
+    if active is not None:
+        q += " AND active=?"
+        args.append(1 if active else 0)
+    q += " ORDER BY position, name"
     with db() as c:
-        rows = c.execute(
-            "SELECT * FROM folders WHERE deleted_at IS NULL ORDER BY position, name",
-        ).fetchall()
+        rows = c.execute(q, args).fetchall()
     return [_row_to_folder(r) for r in rows]
 
 

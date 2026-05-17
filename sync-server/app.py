@@ -620,12 +620,13 @@ def list_folders(
         if include_recent > 0:
             for f in folders:
                 recent = c.execute(
-                    """SELECT uuid, title, status, updated_at, created_at
-                         FROM notes WHERE folder_uuid=? AND deleted_at IS NULL
-                         ORDER BY updated_at DESC LIMIT ?""",
+                    """SELECT * FROM notes WHERE folder_uuid=? AND deleted_at IS NULL
+                       ORDER BY updated_at DESC LIMIT ?""",
                     (f["uuid"], include_recent),
                 ).fetchall()
-                f["recent_notes"] = [dict(r) for r in recent]
+                # _note_summary now includes ai_* so the dashboard view shows
+                # ai_title + ai_summary inline per folder
+                f["recent_notes"] = [_note_summary(r) for r in recent]
     return folders
 
 
@@ -677,6 +678,7 @@ def search(
     updated_at (default) or created_at."""
     needle = q.lower()
     sql = ("""SELECT n.uuid, n.title, n.body, n.status, n.updated_at, n.created_at,
+                     n.ai_title, n.ai_summary, n.ai_status,
                      f.name AS folder_name, n.folder_uuid
               FROM notes n LEFT JOIN folders f ON f.uuid = n.folder_uuid
               WHERE n.deleted_at IS NULL
@@ -708,6 +710,10 @@ def search(
             "folder": r["folder_name"], "folder_uuid": r["folder_uuid"],
             "updated_at": r["updated_at"], "created_at": r["created_at"],
             "snippet": snippet,
+            # AI metadata for at-a-glance ranking — agent picks the right
+            # match without fetching each body.
+            "ai_title": r["ai_title"], "ai_summary": r["ai_summary"],
+            "ai_status": r["ai_status"],
         })
     return {"q": q, "matches": out}
 
@@ -736,13 +742,37 @@ def _resolve_folder(c, name_or_uuid: str) -> dict:
 
 
 def _note_summary(r) -> dict:
-    """Compact note dict for list views — no body, includes everything an agent
-    needs to decide whether to fetch the full body."""
-    return {
+    """Compact note dict for list views — no body, but INCLUDES the
+    AI-generated metadata so an agent can scan issues / projects / recent
+    notes and read titles + summaries + keypoints WITHOUT fetching each
+    body separately.
+
+    Agent UX rule: use ai_title in preference to title (it's specific +
+    distinguishing — the user-typed title is often a generic stub). Show
+    ai_summary as the one-line breadcrumb. ai_keypoints when listing
+    issues so the agent sees what was tried + what's pending.
+
+    ai_tldr deliberately omitted — too long for list views; fetch the full
+    note via /sync/note/{uuid} when diving in."""
+    keys = r.keys() if hasattr(r, "keys") else []
+    out = {
         "uuid": r["uuid"], "title": r["title"], "status": r["status"],
         "folder_uuid": r["folder_uuid"],
         "created_at": r["created_at"], "updated_at": r["updated_at"],
     }
+    # AI metadata fields — present iff worker has populated them
+    for k in ("ai_title", "ai_summary", "ai_status", "ai_generated_at"):
+        if k in keys:
+            out[k] = r[k]
+    for json_col in ("ai_tags", "ai_keypoints"):
+        if json_col in keys and r[json_col]:
+            try:
+                out[json_col] = json.loads(r[json_col])
+            except (ValueError, TypeError):
+                out[json_col] = None
+        elif json_col in keys:
+            out[json_col] = None
+    return out
 
 
 def _split_buckets(notes: list[dict]) -> dict:
@@ -854,7 +884,7 @@ def recent_view(
         ).fetchall()
     out = []
     for r in rows:
-        n = _note_summary(r)
+        n = _note_summary(r)  # already carries ai_title / ai_summary / ai_tags / ai_keypoints / ai_status
         n["folder"] = r["folder_name"]
         if body:
             n["body"] = r["body"]

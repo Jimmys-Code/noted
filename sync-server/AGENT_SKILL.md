@@ -58,6 +58,18 @@ When the operator says "add to this note" / "log that you tried X", use `/append
 ### 5. Single-call writes — use them
 Never do the read-modify-push dance. Use `/sync/note/{uuid}/status`, `/append`, `/replace` directly. Each is atomic and bumps the parent folder for you.
 
+### 6. Prefer AI metadata over raw fields in list views
+Every list endpoint (`/sync/recent`, `/sync/issues`, `/sync/project/{name}`, `/sync/search`, `/sync/folders?include_recent=N`) returns AI-generated metadata inline per note:
+- `ai_title` — concrete, 2-4 word title. Prefer this over `title` when displaying (user's `title` is often a generic stub).
+- `ai_summary` — one-sentence breadcrumb. Show it under the title.
+- `ai_tags` — kebab-case array (e.g. `['vim', 'ios', 'sync']`). Useful for filtering/grouping.
+- `ai_keypoints` — punchy bullets. Surface these when listing issues so you know what was tried + what's pending without fetching the body.
+- `ai_status` — `'ok'` (metadata ready), `'streaming'` (title + summary arriving, deeper fields pending), `'pending'` (worker hasn't picked up yet), `'skipped'` (stub note < 30 chars), `'failed'` (worker gave up — check ai_error on full GET).
+
+Don't fetch `/sync/note/{uuid}` for the full body unless the agent ACTUALLY needs the prose — `ai_summary` + `ai_keypoints` usually answer "what's this note about?" in 100x less context.
+
+`ai_tldr` is NOT in list views (too long) — fetch the full note when diving in.
+
 ---
 
 ## The 10 endpoints

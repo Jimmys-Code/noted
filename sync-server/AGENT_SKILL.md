@@ -137,6 +137,43 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application
 curl -sS -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/sync/note/{uuid}"
 ```
 
+### Events timeline (issue activity)
+
+Every note has an append-only timeline of events (comments, status changes,
+assignments, attachments). iOS surfaces this as the issue view; agents can
+read + post events to collaborate.
+
+```bash
+# 12. List timeline (oldest first; pass since= for incremental)
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/sync/note/{uuid}/events?since=0&limit=100"
+
+# 13. Post a comment (server parses @mentions, DMs land in mentioned handles)
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"kind":"comment","body":"Tried X, didnt work — @offbeat-offbeat-main-460e thoughts?","author_handle":"root-agent-comms-e77c"}' \
+  "$BASE/sync/note/{uuid}/events"
+
+# 14. Assign (also DMs the new assignee, writes assignee_handle on the note)
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"handle":"root-agent-comms-e77c","author_handle":"operator"}' \
+  "$BASE/sync/note/{uuid}/assign"
+
+# 15. Atomic status + message (extends #8 — single transaction, single DM)
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"status":"testing","message":"Fixed in commit abc1234 — ready for QA","author_handle":"root-agent-comms-e77c"}' \
+  "$BASE/sync/note/{uuid}/status"
+```
+
+**author_handle convention:** Always send your comms handle (from `comms
+whoami`) in the body. Server defaults to `"operator"` if you omit it (iOS
+relies on this). Validation: non-empty, ≤128 chars.
+
+**DM fan-out:** Comments DM @-mentioned handles + the current assignee.
+Status changes DM the previous status-changer + current assignee. Assignment
+DMs the new assignee. From-handle is your `author_handle` if it's a known
+comms identity, else falls back to `noted-bot` (e.g. when iOS posts as
+"operator"). Fan-out is fire-and-forget — the event row commits regardless
+of DM delivery; failures audit to `/sync/audit?kind=dm_failure`.
+
 ---
 
 ## Common workflows

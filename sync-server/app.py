@@ -37,11 +37,13 @@ try:
     from . import crypto as _crypto
     from . import github_client as _gh
     from . import ai_metadata as _ai
+    from . import comms_notify as _comms
 except ImportError:
     from fuzzy_edit import str_replace as _fuzzy_str_replace
     import crypto as _crypto
     import github_client as _gh
     import ai_metadata as _ai
+    import comms_notify as _comms
 
 NoteStatus = Literal["idea", "open", "in-progress", "testing", "done"]
 FolderKind = Literal["general", "project"]
@@ -127,6 +129,26 @@ CREATE TABLE IF NOT EXISTS sync_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_sync_audit_ts ON sync_audit(ts);
 CREATE INDEX IF NOT EXISTS idx_sync_audit_kind_ts ON sync_audit(kind, ts);
+
+-- Issue timeline: every comment / status_change / assigned / attachment on a
+-- note becomes an immutable event row. Noted = source of truth for issue
+-- state + history; agent-comms is the notification bell. ON DELETE CASCADE
+-- only fires on hard delete (tombstones don't trigger it) so events
+-- accumulate as intended issue history.
+CREATE TABLE IF NOT EXISTS note_events (
+    uuid               TEXT PRIMARY KEY,
+    note_uuid          TEXT NOT NULL REFERENCES notes(uuid) ON DELETE CASCADE,
+    author_handle      TEXT NOT NULL,
+    kind               TEXT NOT NULL,
+    body               TEXT,
+    status_from        TEXT,
+    status_to          TEXT,
+    assignee_handle    TEXT,
+    mentioned_handles  TEXT,
+    created_at         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_note_events_note_created ON note_events(note_uuid, created_at);
+CREATE INDEX IF NOT EXISTS idx_note_events_kind_created ON note_events(kind, created_at);
 
 -- --- Git integration tables ---
 -- PATs encrypted with Fernet (see crypto.py). key_version stamps which key
@@ -261,6 +283,10 @@ def _migrate(c):
 
     if "status" not in ncols:
         c.execute("ALTER TABLE notes ADD COLUMN status TEXT")
+    if "assignee_handle" not in ncols:
+        c.execute("ALTER TABLE notes ADD COLUMN assignee_handle TEXT")
+    if "assignee_handle_set_at" not in ncols:
+        c.execute("ALTER TABLE notes ADD COLUMN assignee_handle_set_at INTEGER")
 
     # AI-generated metadata. Worker thread scans for ai_status='pending' rows
     # and fills these in by calling OpenRouter. Round-tripped via /sync/changes.
@@ -326,6 +352,9 @@ class FolderOut(FolderIn):
 
 
 class NoteOut(NoteIn):
+    # Assignment metadata — populated by POST /sync/note/{uuid}/assign
+    assignee_handle: Optional[str] = None
+    assignee_handle_set_at: Optional[int] = None
     # AI-generated metadata. Optional on the wire because:
     #  - notes from before the migration may have all-NULL columns
     #  - in-flight notes show ai_status='pending'/'streaming' with title or
@@ -383,6 +412,9 @@ def _row_to_note(r) -> dict:
         "created_at": r["created_at"], "updated_at": r["updated_at"],
         "deleted_at": r["deleted_at"], "status": r["status"],
     }
+    for k in ("assignee_handle", "assignee_handle_set_at"):
+        if k in keys:
+            out[k] = r[k]
     # AI metadata — present on every row read post-migration. JSON columns
     # decoded to native arrays so iOS doesn't double-parse.
     for k in ("ai_title", "ai_summary", "ai_tldr", "ai_generated_at",
@@ -1050,31 +1082,273 @@ def create_note(payload: NoteCreateIn,
     return _row_to_note(row)
 
 
+def _validate_author_handle(h: Optional[str]) -> str:
+    """Per Troy's convention: validate non-empty + reasonably short. Default
+    to 'operator' if missing. The bearer doesn't carry identity (single-user
+    baked token), so we trust what the client sends but bound the input."""
+    if not h or not h.strip():
+        return "operator"
+    h = h.strip()
+    if len(h) > 128:
+        raise HTTPException(400, f"author_handle too long ({len(h)} > 128)")
+    return h
+
+
+def _insert_event(c, note_uuid: str, author_handle: str, kind: str,
+                  body: Optional[str] = None, status_from: Optional[str] = None,
+                  status_to: Optional[str] = None,
+                  assignee_handle: Optional[str] = None) -> dict:
+    """Atomic event-row insertion. Returns the inserted event dict + the
+    parsed mentioned_handles list (for fan-out — caller schedules the DMs
+    after the transaction commits)."""
+    import uuid as _uuid
+    ts = now_ms()
+    eid = _uuid.uuid4().hex
+    mentions = _comms.parse_mentions(body) if body else []
+    c.execute(
+        """INSERT INTO note_events
+             (uuid, note_uuid, author_handle, kind, body, status_from, status_to,
+              assignee_handle, mentioned_handles, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (eid, note_uuid, author_handle, kind, body, status_from, status_to,
+         assignee_handle, json.dumps(mentions) if mentions else None, ts),
+    )
+    return {
+        "uuid": eid, "note_uuid": note_uuid, "author_handle": author_handle,
+        "kind": kind, "body": body, "status_from": status_from, "status_to": status_to,
+        "assignee_handle": assignee_handle, "mentioned_handles": mentions,
+        "created_at": ts,
+    }
+
+
+def _record_dm_failure(handle: str, code: int, resp):
+    """Wired as on_failure for comms_notify.fan_out_async — writes to
+    sync_audit so chronic delivery problems are diagnosable."""
+    try:
+        with db() as c:
+            c.execute(
+                "INSERT INTO sync_audit (ts, kind, note_uuid, details) VALUES (?,?,?,?)",
+                (now_ms(), "dm_failure", None,
+                 json.dumps({"to_handle": handle, "status": code, "response": str(resp)[:300]})),
+            )
+    except Exception:
+        pass  # last-resort; don't let an audit failure crash the background thread
+
+
+def _fan_out_event(event: dict, note_row: sqlite3.Row):
+    """Decide who to DM based on the event's kind and dispatch async.
+    Recipients deduped + sender stripped inside fan_out_async. Body composed
+    to be readable in a comms inbox preview."""
+    note_title = (note_row["ai_title"] if "ai_title" in note_row.keys() and note_row["ai_title"]
+                  else note_row["title"]) or "(untitled)"
+    note_uuid = event["note_uuid"]
+    author = event["author_handle"]
+    kind = event["kind"]
+    recipients: list[str] = []
+    title = ""
+    summary = ""
+    body_lines: list[str] = []
+
+    if kind == "assigned":
+        target = event.get("assignee_handle")
+        if target:
+            recipients.append(target)
+        title = f"Assigned to you: {note_title}"
+        summary = f"{author} assigned you this issue"
+        body_lines.append(f"{author} assigned this to you.")
+    elif kind == "status_change":
+        title = f"Status → {event['status_to']}: {note_title}"
+        summary = f"{author} set status to '{event['status_to']}'"
+        body_lines.append(f"{author} changed status: {event['status_from']} → {event['status_to']}")
+        if event.get("body"):
+            body_lines.append("")
+            body_lines.append(f"Message: {event['body']}")
+        # Notify previous status-changer + current assignee (if any, not author)
+        try:
+            with db() as c:
+                prev = c.execute(
+                    """SELECT author_handle FROM note_events
+                        WHERE note_uuid=? AND kind='status_change' AND uuid<>?
+                        ORDER BY created_at DESC LIMIT 1""",
+                    (note_uuid, event["uuid"]),
+                ).fetchone()
+                if prev and prev["author_handle"]:
+                    recipients.append(prev["author_handle"])
+            if "assignee_handle" in note_row.keys() and note_row["assignee_handle"]:
+                recipients.append(note_row["assignee_handle"])
+        except Exception:
+            pass
+    elif kind == "comment":
+        title = f"Comment on: {note_title}"
+        summary = f"{author}: {(event.get('body') or '')[:120]}"
+        body_lines.append(f"{author} commented:")
+        body_lines.append("")
+        body_lines.append(event.get("body") or "")
+        recipients.extend(event.get("mentioned_handles") or [])
+        if "assignee_handle" in note_row.keys() and note_row["assignee_handle"]:
+            recipients.append(note_row["assignee_handle"])
+    elif kind == "attachment":
+        title = f"Attachment added: {note_title}"
+        summary = f"{author} attached: {(event.get('body') or '')[:120]}"
+        body_lines.append(f"{author} added an attachment.")
+        if event.get("body"):
+            body_lines.append(event["body"])
+        if "assignee_handle" in note_row.keys() and note_row["assignee_handle"]:
+            recipients.append(note_row["assignee_handle"])
+    else:
+        return  # unknown kind; nothing to fan out
+
+    if not recipients:
+        return
+    body_lines.append("")
+    body_lines.append(f"Note uuid: {note_uuid}")
+    body_text = "\n".join(body_lines)
+
+    _comms.fan_out_async(
+        from_handle=author, recipients=recipients,
+        title=title, summary=summary, body=body_text,
+        on_failure=_record_dm_failure,
+    )
+
+
 class StatusIn(BaseModel):
     status: Optional[NoteStatus]  # required key; null clears status (plain note)
+    message: Optional[str] = None
+    author_handle: Optional[str] = None  # default 'operator' via validator
 
 
 @app.post("/sync/note/{nid}/status", dependencies=[auth])
 def set_status(nid: str, payload: StatusIn,
                as_operator: bool = Query(False, description="operator override for status='done' (QC gate)")):
-    """Change a note's status in one call. Pass status=null to clear (revert
-    to plain note). Server bumps updated_at + parent folder atomically.
+    """Change a note's status in one call, optionally attaching a comment.
+    Atomic: the status update + the status_change event row land in the
+    SAME transaction. Single DM fan-out follows. Pass status=null to clear
+    (revert to plain note).
 
     QC gate: status='done' is reserved for the operator. Agents finishing
     work should set 'testing' — operator verifies on their device and flips
     to 'done' from there. Override with ?as_operator=true if you ARE the
     operator's UI."""
     _enforce_done_is_operator_only(payload.status, as_operator)
+    author = _validate_author_handle(payload.author_handle)
+    ts = now_ms()
+    with db() as c:
+        existing = _fetch_note(c, nid)
+        old_status = existing["status"]
+        new_status = payload.status
+        c.execute(
+            "UPDATE notes SET status=?, updated_at=? WHERE uuid=?",
+            (new_status, ts, nid),
+        )
+        _bump_parent_folder(c, existing["folder_uuid"], ts)
+        _mark_ai_pending(c, nid)
+        # Event row — write IFF status actually changed OR a message was attached.
+        # (Bare same-status writes don't deserve a timeline entry.)
+        event = None
+        if old_status != new_status or (payload.message and payload.message.strip()):
+            event = _insert_event(
+                c, nid, author, "status_change",
+                body=(payload.message.strip() if payload.message else None),
+                status_from=old_status, status_to=new_status,
+            )
+        row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
+    # Fan-out OUTSIDE the with-block so DB is committed before DMs reference it
+    if event:
+        _fan_out_event(event, row)
+    return _row_to_note(row)
+
+
+# --- Issue events timeline (Noted = source of truth for issue history) ---
+
+class EventIn(BaseModel):
+    kind: Literal["comment", "assigned", "attachment"]  # status_change is via /status endpoint
+    body: Optional[str] = None
+    assignee_handle: Optional[str] = None  # for kind='assigned'
+    author_handle: Optional[str] = None
+
+
+@app.get("/sync/note/{nid}/events", dependencies=[auth])
+def list_events(nid: str,
+                since: int = Query(0, ge=0, description="ms epoch; events created_at > since"),
+                limit: int = Query(100, ge=1, le=500)):
+    """List timeline events for a note, ordered by created_at ASC. Pass
+    `since` for incremental pulls (iOS GRDB mirror polls with last cursor)."""
+    with db() as c:
+        _fetch_note(c, nid)  # 404s if note missing — keeps endpoint surface consistent
+        rows = c.execute(
+            """SELECT * FROM note_events
+                WHERE note_uuid=? AND created_at > ?
+                ORDER BY created_at ASC LIMIT ?""",
+            (nid, since, limit),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("mentioned_handles"):
+            try:
+                d["mentioned_handles"] = json.loads(d["mentioned_handles"])
+            except (ValueError, TypeError):
+                d["mentioned_handles"] = []
+        else:
+            d["mentioned_handles"] = []
+        out.append(d)
+    return {"note_uuid": nid, "since": since, "events": out}
+
+
+@app.post("/sync/note/{nid}/events", dependencies=[auth])
+def post_event(nid: str, payload: EventIn):
+    """Append a comment / assignment / attachment event. status_change is
+    NOT accepted here — use POST /sync/note/{nid}/status which handles
+    status + optional message atomically."""
+    if payload.kind == "comment" and not (payload.body and payload.body.strip()):
+        raise HTTPException(400, "comment events require non-empty body")
+    if payload.kind == "assigned" and not payload.assignee_handle:
+        raise HTTPException(400, "assigned events require assignee_handle")
+    author = _validate_author_handle(payload.author_handle)
+    with db() as c:
+        _fetch_note(c, nid)
+        event = _insert_event(
+            c, nid, author, payload.kind,
+            body=(payload.body.strip() if payload.body else None),
+            assignee_handle=payload.assignee_handle,
+        )
+        # If kind=assigned, also update notes.assignee_handle + timestamp
+        if payload.kind == "assigned":
+            ts = now_ms()
+            c.execute(
+                "UPDATE notes SET assignee_handle=?, assignee_handle_set_at=?, updated_at=? WHERE uuid=?",
+                (payload.assignee_handle, ts, ts, nid),
+            )
+            _bump_parent_folder(c, _fetch_note(c, nid)["folder_uuid"], ts)
+        row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
+    _fan_out_event(event, row)
+    return event
+
+
+class AssignIn(BaseModel):
+    handle: str
+    author_handle: Optional[str] = None
+
+
+@app.post("/sync/note/{nid}/assign", dependencies=[auth])
+def assign_note(nid: str, payload: AssignIn):
+    """Convenience: assign a note to a handle. Writes an 'assigned' event
+    AND updates notes.assignee_handle + assignee_handle_set_at atomically.
+    Single DM to the new assignee."""
+    if not payload.handle.strip():
+        raise HTTPException(400, "handle required")
+    author = _validate_author_handle(payload.author_handle)
     ts = now_ms()
     with db() as c:
         existing = _fetch_note(c, nid)
         c.execute(
-            "UPDATE notes SET status=?, updated_at=? WHERE uuid=?",
-            (payload.status, ts, nid),
+            "UPDATE notes SET assignee_handle=?, assignee_handle_set_at=?, updated_at=? WHERE uuid=?",
+            (payload.handle.strip(), ts, ts, nid),
         )
         _bump_parent_folder(c, existing["folder_uuid"], ts)
-        _mark_ai_pending(c, nid)
+        event = _insert_event(c, nid, author, "assigned", assignee_handle=payload.handle.strip())
         row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
+    _fan_out_event(event, row)
     return _row_to_note(row)
 
 

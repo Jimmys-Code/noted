@@ -113,6 +113,21 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attachments_sha ON attachments(sha256);
 
+-- Audit log for diagnostic events the operator/developer might want to
+-- review later. Currently only emits 'status_regression' rows when a
+-- /sync/push appears to revert a status='done' back to something earlier
+-- with otherwise-identical body/title (signature of a stale client-side
+-- snapshot push). LWW still applies — we LOG, we don't BLOCK.
+CREATE TABLE IF NOT EXISTS sync_audit (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    note_uuid    TEXT,
+    details      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sync_audit_ts ON sync_audit(ts);
+CREATE INDEX IF NOT EXISTS idx_sync_audit_kind_ts ON sync_audit(kind, ts);
+
 -- --- Git integration tables ---
 -- PATs encrypted with Fernet (see crypto.py). key_version stamps which key
 -- was used so we can rotate without one-shot re-encrypting everything.
@@ -450,11 +465,19 @@ def push(payload: PushIn):
             accepted_f.append(f.uuid)
         for n in payload.notes:
             existing = c.execute(
-                "SELECT updated_at, folder_uuid FROM notes WHERE uuid=?", (n.uuid,),
+                "SELECT updated_at, folder_uuid, status, title, body FROM notes WHERE uuid=?",
+                (n.uuid,),
             ).fetchone()
             if existing and existing["updated_at"] >= n.updated_at:
                 rejected_n.append(n.uuid)
                 continue
+            # Diagnostic: detect status regressions that look like stale-snapshot pushes.
+            # Don't BLOCK — just log. LWW continues to apply normally so the
+            # client's intent is honored; this gives us forensic data for the
+            # iOS save-on-back-out race shape.
+            if existing and existing["status"] == "done" and n.status != "done" \
+                    and existing["title"] == n.title and existing["body"] == n.body:
+                _log_status_regression(c, n, dict(existing))
             c.execute(
                 """INSERT INTO notes (uuid,folder_uuid,title,body,created_at,updated_at,deleted_at,status)
                    VALUES (?,?,?,?,?,?,?,?)
@@ -488,6 +511,33 @@ def push(payload: PushIn):
         "accepted_notes": accepted_n, "rejected_notes": rejected_n,
         "server_ts": now_ms(),
     }
+
+
+@app.get("/sync/audit", dependencies=[auth])
+def sync_audit(kind: Optional[str] = Query(None, description="filter by kind, e.g. 'status_regression'"),
+               limit: int = Query(50, ge=1, le=500)):
+    """Recent audit entries (diagnostic only). Returns newest first.
+    Currently only emits 'status_regression' events when a /sync/push
+    looks like a stale-snapshot revert of a 'done' status."""
+    q = "SELECT id, ts, kind, note_uuid, details FROM sync_audit"
+    args: list = []
+    if kind:
+        q += " WHERE kind=?"
+        args.append(kind)
+    q += " ORDER BY ts DESC LIMIT ?"
+    args.append(limit)
+    with db() as c:
+        rows = c.execute(q, args).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if d.get("details"):
+            try:
+                d["details"] = json.loads(d["details"])
+            except (ValueError, TypeError):
+                pass
+        out.append(d)
+    return {"count": len(out), "entries": out}
 
 
 @app.get("/sync/state", dependencies=[auth])
@@ -896,6 +946,32 @@ def recent_view(
 # These replace the read-modify-push dance that /sync/push requires. Server
 # does the bookkeeping atomically: bump updated_at, bump parent folder's
 # last_activity_at + updated_at, return the updated note.
+
+def _log_status_regression(c, incoming, existing: dict):
+    """Diagnostic: a /sync/push appears to be reverting a 'done' status with
+    identical body/title — signature of a stale client-side snapshot push
+    (operator hit 'done', then the back-out save fired with a pre-click
+    snapshot). LWW still applies; this only logs for forensics. Writes to
+    sync_audit + stderr (journalctl) for double visibility."""
+    ts = now_ms()
+    details = json.dumps({
+        "old_status": existing.get("status"),
+        "new_status": incoming.status,
+        "server_updated_at": existing.get("updated_at"),
+        "push_updated_at": incoming.updated_at,
+        "body_unchanged": True,
+        "title_unchanged": True,
+    })
+    c.execute(
+        "INSERT INTO sync_audit (ts, kind, note_uuid, details) VALUES (?, ?, ?, ?)",
+        (ts, "status_regression", incoming.uuid, details),
+    )
+    print(f"[sync_audit] status_regression uuid={incoming.uuid} "
+          f"server_status={existing.get('status')} push_status={incoming.status} "
+          f"server_updated_at={existing.get('updated_at')} push_updated_at={incoming.updated_at} "
+          f"body/title unchanged → likely stale-snapshot push",
+          flush=True)
+
 
 def _bump_parent_folder(c, folder_uuid: Optional[str], ts: int):
     """Bump parent folder's last_activity_at + updated_at to ts via MAX merge

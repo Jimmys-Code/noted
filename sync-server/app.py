@@ -1552,6 +1552,11 @@ AI_POLL_SECONDS = float(os.environ.get("AI_POLL_SECONDS", "1.5"))
 AI_BATCH_SIZE = int(os.environ.get("AI_BATCH_SIZE", "3"))
 AI_MAX_ATTEMPTS = int(os.environ.get("AI_MAX_ATTEMPTS", "5"))
 AI_MAX_BACKOFF_SECONDS = int(os.environ.get("AI_MAX_BACKOFF_SECONDS", "300"))
+# How often the catchall backfill scan runs — finds notes WHERE ai_status IS
+# NULL despite having a substantive body and re-marks them 'pending' so the
+# main worker picks them up. Catches anything that slipped past the write
+# triggers (legacy notes pre-migration, edge cases, dropped triggers, etc).
+AI_BACKFILL_INTERVAL_SECONDS = int(os.environ.get("AI_BACKFILL_INTERVAL_SECONDS", "300"))
 
 
 def _mark_ai_pending(c, note_uuid: str):
@@ -1684,15 +1689,69 @@ def _ai_worker_pass():
                     )
 
 
+def _ai_backfill_scan() -> int:
+    """Catchall: find alive notes with NULL ai_status and either:
+      (a) substantive body  → mark 'pending', worker picks up
+      (b) stub body < 30c   → mark 'skipped', clean data model
+
+    Returns count NEWLY-PENDED (not including skipped). Skips notes that
+    previously failed (don't burn tokens retrying chronic failures —
+    input change re-pends via _mark_ai_pending)."""
+    with db() as c:
+        # Pending: real notes that need AI
+        pending = c.execute(
+            """UPDATE notes
+                  SET ai_status='pending', ai_attempts=0, ai_error=NULL
+                WHERE deleted_at IS NULL
+                  AND ai_status IS NULL
+                  AND length(trim(body)) >= ?""",
+            (_ai.MIN_BODY_CHARS_FOR_AI,),
+        ).rowcount
+        # Skipped: stub notes (covers operator-typed "asdf" tests, etc)
+        c.execute(
+            """UPDATE notes SET ai_status='skipped'
+                WHERE deleted_at IS NULL
+                  AND ai_status IS NULL
+                  AND length(trim(body)) < ?""",
+            (_ai.MIN_BODY_CHARS_FOR_AI,),
+        )
+        return pending
+
+
 def _ai_worker_loop():
-    """Daemon thread. Sleeps AI_POLL_SECONDS between passes. Caught errors
-    don't kill the loop — only an interpreter shutdown should stop it."""
+    """Daemon thread. Sleeps AI_POLL_SECONDS between processing passes.
+    Every AI_BACKFILL_INTERVAL_SECONDS, also runs a catchall scan that
+    re-marks unmetadata'd notes as pending. Caught errors don't kill the
+    loop — only an interpreter shutdown should stop it."""
     import time as _t
+    last_backfill_at = 0.0
+    # Initial scan on startup so the worker doesn't wait the full interval
+    # to catch up after a restart.
+    try:
+        n = _ai_backfill_scan()
+        if n:
+            print(f"[ai_worker] startup backfill: re-pended {n} notes without AI metadata", flush=True)
+    except Exception as e:
+        print(f"[ai_worker] startup backfill error: {e}", flush=True)
+    last_backfill_at = _t.time()
+
     while True:
         try:
             _ai_worker_pass()
         except Exception as e:
             print(f"[ai_worker] pass error: {e}", flush=True)
+
+        # Periodic catchall — runs in the same thread between processing
+        # passes so we don't need a separate timer/thread.
+        if (_t.time() - last_backfill_at) >= AI_BACKFILL_INTERVAL_SECONDS:
+            try:
+                n = _ai_backfill_scan()
+                if n:
+                    print(f"[ai_worker] backfill scan: re-pended {n} notes", flush=True)
+            except Exception as e:
+                print(f"[ai_worker] backfill error: {e}", flush=True)
+            last_backfill_at = _t.time()
+
         _t.sleep(AI_POLL_SECONDS)
 
 

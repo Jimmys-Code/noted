@@ -306,6 +306,76 @@ def stream_for_note(note_title: Optional[str], body: str,
     on_done(metadata)
 
 
+EVENT_SUMMARY_SYSTEM = """You generate a one-line headline + one-sentence
+summary for a single event in an issue tracker. The operator scans the
+timeline and wants to know what happened at a glance.
+
+Return ONLY a JSON object, no preamble, no markdown fence:
+
+  {
+    "title":   "4-6 words, concrete, the gist of THIS event",
+    "summary": "ONE sentence (under 120 chars) — what changed + why"
+  }
+
+RULES:
+- Title: 4-6 words MAX. Concrete + specific. NEVER generic ("status update",
+  "fix shipped", "comment"). Use the actual content: filename, person name,
+  exact symptom, PR number, what was tried.
+  Good: "PR #47, 800ms debounce shipped"
+  Bad:  "Status change to testing"
+- Summary: distill the event body into one sentence. Skip ceremony ("this
+  comment says…"). State the change/finding/decision directly.
+- For status_change events with a message body, the title should reflect
+  the GIST OF THE MESSAGE, not just the status transition (which is shown
+  alongside in the UI). The summary mentions both the message gist AND
+  the transition briefly.
+- Match the operator's voice: terse, no AI-isms (no "I'd be happy to",
+  no em-dashes, no "robust" / "delve into" / "leverage").
+
+Output JSON only."""
+
+
+def _build_event_user_prompt(event_kind: str, body: str,
+                              note_title: Optional[str],
+                              status_from: Optional[str],
+                              status_to: Optional[str]) -> str:
+    parts = []
+    parts.append(f"Event kind: {event_kind}")
+    if status_from or status_to:
+        parts.append(f"Status transition: {status_from or 'null'} → {status_to or 'null'}")
+    if note_title:
+        parts.append(f"Parent note title: {note_title!r}")
+    parts.append("")
+    parts.append("EVENT BODY:")
+    parts.append(body)
+    parts.append("")
+    parts.append("Return JSON only.")
+    return "\n".join(parts)
+
+
+def generate_for_event(event_kind: str, body: str,
+                        note_title: Optional[str] = None,
+                        status_from: Optional[str] = None,
+                        status_to: Optional[str] = None,
+                        model: str = DEFAULT_MODEL) -> dict:
+    """Returns {title, summary, model}. Raises on failure — caller handles
+    retry + audit. Shorter response than note metadata, so no streaming
+    needed — single-shot is fast enough."""
+    user_prompt = _build_event_user_prompt(event_kind, body, note_title, status_from, status_to)
+    raw = _call_openrouter(EVENT_SUMMARY_SYSTEM, user_prompt, model=model,
+                            max_tokens=200, temperature=0.3)
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n", "", text)
+        text = re.sub(r"\n```$", "", text)
+    parsed = json.loads(text)
+    return {
+        "title":   _strip_dashes(parsed.get("title")),
+        "summary": _strip_dashes(parsed.get("summary")),
+        "model":   model,
+    }
+
+
 def compute_input_hash(body: str, title: Optional[str], folder_name: Optional[str],
                        status: Optional[str]) -> str:
     """Stable hash of the inputs that drive AI generation. Stored on rows so

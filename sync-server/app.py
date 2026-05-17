@@ -145,10 +145,21 @@ CREATE TABLE IF NOT EXISTS note_events (
     status_to          TEXT,
     assignee_handle    TEXT,
     mentioned_handles  TEXT,
-    created_at         INTEGER NOT NULL
+    created_at         INTEGER NOT NULL,
+    -- AI-generated condensed view of the event (worker fills these in).
+    -- Only meaningful for kind IN ('comment', 'status_change') with body > 30
+    -- chars; other kinds stay NULL and don't trigger the worker.
+    ai_title           TEXT,
+    ai_summary         TEXT,
+    ai_status          TEXT,                     -- NULL | 'pending' | 'ok' | 'failed' | 'skipped'
+    ai_attempts        INTEGER NOT NULL DEFAULT 0,
+    ai_error           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_note_events_note_created ON note_events(note_uuid, created_at);
 CREATE INDEX IF NOT EXISTS idx_note_events_kind_created ON note_events(kind, created_at);
+-- idx_note_events_ai_status is created in _migrate after the column ALTER
+-- (CREATE TABLE IF NOT EXISTS is a no-op on already-existing tables, so
+-- the ai_status column may not exist yet at SCHEMA-script time).
 
 -- --- Git integration tables ---
 -- PATs encrypted with Fernet (see crypto.py). key_version stamps which key
@@ -287,6 +298,25 @@ def _migrate(c):
         c.execute("ALTER TABLE notes ADD COLUMN assignee_handle TEXT")
     if "assignee_handle_set_at" not in ncols:
         c.execute("ALTER TABLE notes ADD COLUMN assignee_handle_set_at INTEGER")
+
+    # note_events table — additive AI columns
+    try:
+        ecols = {r["name"] for r in c.execute("PRAGMA table_info(note_events)").fetchall()}
+    except Exception:
+        ecols = set()
+    if ecols:
+        for col, ddl in [
+            ("ai_title",    "TEXT"),
+            ("ai_summary",  "TEXT"),
+            ("ai_status",   "TEXT"),
+            ("ai_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("ai_error",    "TEXT"),
+        ]:
+            if col not in ecols:
+                c.execute(f"ALTER TABLE note_events ADD COLUMN {col} {ddl}")
+        # Created here (not in SCHEMA) since the column may not exist on
+        # already-existing tables at SCHEMA-script time.
+        c.execute("CREATE INDEX IF NOT EXISTS idx_note_events_ai_status ON note_events(ai_status)")
 
     # AI-generated metadata. Worker thread scans for ai_status='pending' rows
     # and fills these in by calling OpenRouter. Round-tripped via /sync/changes.
@@ -1094,30 +1124,44 @@ def _validate_author_handle(h: Optional[str]) -> str:
     return h
 
 
+_AI_EVENT_KINDS = ("comment", "status_change")
+
+
 def _insert_event(c, note_uuid: str, author_handle: str, kind: str,
                   body: Optional[str] = None, status_from: Optional[str] = None,
                   status_to: Optional[str] = None,
                   assignee_handle: Optional[str] = None) -> dict:
     """Atomic event-row insertion. Returns the inserted event dict + the
     parsed mentioned_handles list (for fan-out — caller schedules the DMs
-    after the transaction commits)."""
+    after the transaction commits).
+
+    Sets ai_status='pending' for kinds the AI worker should process (comment,
+    status_change) when the body is substantive. Other kinds + stubs stay
+    NULL/'skipped' so they don't burn tokens."""
     import uuid as _uuid
     ts = now_ms()
     eid = _uuid.uuid4().hex
     mentions = _comms.parse_mentions(body) if body else []
+    # Decide ai_status at insert time so the worker picks it up next pass
+    if kind in _AI_EVENT_KINDS and body and len(body.strip()) >= _ai.MIN_BODY_CHARS_FOR_AI:
+        ai_status_initial = "pending"
+    elif kind in _AI_EVENT_KINDS:
+        ai_status_initial = "skipped"  # short body / no body
+    else:
+        ai_status_initial = None  # assigned / attachment — no AI metadata needed
     c.execute(
         """INSERT INTO note_events
              (uuid, note_uuid, author_handle, kind, body, status_from, status_to,
-              assignee_handle, mentioned_handles, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+              assignee_handle, mentioned_handles, created_at, ai_status)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         (eid, note_uuid, author_handle, kind, body, status_from, status_to,
-         assignee_handle, json.dumps(mentions) if mentions else None, ts),
+         assignee_handle, json.dumps(mentions) if mentions else None, ts, ai_status_initial),
     )
     return {
         "uuid": eid, "note_uuid": note_uuid, "author_handle": author_handle,
         "kind": kind, "body": body, "status_from": status_from, "status_to": status_to,
         "assignee_handle": assignee_handle, "mentioned_handles": mentions,
-        "created_at": ts,
+        "created_at": ts, "ai_status": ai_status_initial,
     }
 
 
@@ -1291,6 +1335,10 @@ def list_events(nid: str,
                 d["mentioned_handles"] = []
         else:
             d["mentioned_handles"] = []
+        # Drop internal worker bookkeeping from the wire shape; clients only
+        # need the surfaced AI fields.
+        d.pop("ai_attempts", None)
+        d.pop("ai_error", None)
         out.append(d)
     return {"note_uuid": nid, "since": since, "events": out}
 
@@ -2039,6 +2087,52 @@ def _ai_worker_pass():
                     )
 
 
+def _ai_worker_pass_events():
+    """Event-summary pass. Picks AI_BATCH_SIZE oldest pending event rows
+    (kind IN comment/status_change with substantive body), generates a
+    title + summary via OpenRouter, writes back. Single-shot (no stream)
+    because the response is small. Exceptions caught + recorded so worker
+    stays alive."""
+    with db() as c:
+        rows = c.execute(
+            """SELECT e.uuid, e.note_uuid, e.kind, e.body, e.status_from, e.status_to,
+                      e.ai_attempts, n.title AS note_title, n.ai_title AS note_ai_title
+                 FROM note_events e LEFT JOIN notes n ON n.uuid = e.note_uuid
+                WHERE e.ai_status='pending'
+                  AND e.kind IN ('comment','status_change')
+                  AND e.ai_attempts < ?
+             ORDER BY e.created_at ASC LIMIT ?""",
+            (AI_MAX_ATTEMPTS, AI_BATCH_SIZE),
+        ).fetchall()
+    for r in rows:
+        eid = r["uuid"]
+        # Prefer AI-generated note title (cleaner) over user-typed title
+        parent_title = r["note_ai_title"] or r["note_title"] or None
+        try:
+            meta = _ai.generate_for_event(
+                event_kind=r["kind"], body=r["body"] or "",
+                note_title=parent_title,
+                status_from=r["status_from"], status_to=r["status_to"],
+            )
+        except Exception as e:
+            with db() as c3:
+                next_attempts = r["ai_attempts"] + 1
+                c3.execute(
+                    "UPDATE note_events SET ai_attempts=?, ai_status=?, ai_error=? WHERE uuid=?",
+                    (next_attempts,
+                     "failed" if next_attempts >= AI_MAX_ATTEMPTS else "pending",
+                     str(e)[:500], eid),
+                )
+            continue
+        with db() as c4:
+            c4.execute(
+                """UPDATE note_events SET
+                       ai_title=?, ai_summary=?, ai_status='ok', ai_error=NULL
+                   WHERE uuid=?""",
+                (meta["title"], meta["summary"], eid),
+            )
+
+
 def _ai_backfill_scan() -> int:
     """Catchall: find alive notes with NULL ai_status and either:
       (a) substantive body  → mark 'pending', worker picks up
@@ -2065,6 +2159,29 @@ def _ai_backfill_scan() -> int:
                   AND length(trim(body)) < ?""",
             (_ai.MIN_BODY_CHARS_FOR_AI,),
         )
+        # Same catchall for note_events — picks up rows created before the
+        # ai_* columns existed, or anything that somehow got into a NULL
+        # ai_status post-feature (shouldn't happen via _insert_event but
+        # belt-and-suspenders).
+        try:
+            event_pending = c.execute(
+                """UPDATE note_events
+                      SET ai_status='pending', ai_attempts=0, ai_error=NULL
+                    WHERE ai_status IS NULL
+                      AND kind IN ('comment','status_change')
+                      AND length(trim(body)) >= ?""",
+                (_ai.MIN_BODY_CHARS_FOR_AI,),
+            ).rowcount
+            c.execute(
+                """UPDATE note_events SET ai_status='skipped'
+                    WHERE ai_status IS NULL
+                      AND (kind NOT IN ('comment','status_change')
+                           OR length(trim(COALESCE(body, ''))) < ?)""",
+                (_ai.MIN_BODY_CHARS_FOR_AI,),
+            )
+            pending += event_pending
+        except Exception:
+            pass  # note_events may not exist yet on very-fresh DBs (CREATE runs first though)
         return pending
 
 
@@ -2090,6 +2207,10 @@ def _ai_worker_loop():
             _ai_worker_pass()
         except Exception as e:
             print(f"[ai_worker] pass error: {e}", flush=True)
+        try:
+            _ai_worker_pass_events()
+        except Exception as e:
+            print(f"[ai_worker] event pass error: {e}", flush=True)
 
         # Periodic catchall — runs in the same thread between processing
         # passes so we don't need a separate timer/thread.

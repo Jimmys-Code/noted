@@ -1374,27 +1374,27 @@ def post_event(nid: str, payload: EventIn):
 
 
 class AssignIn(BaseModel):
-    handle: str
+    handle: Optional[str] = None   # null/empty unassigns
     author_handle: Optional[str] = None
 
 
 @app.post("/sync/note/{nid}/assign", dependencies=[auth])
 def assign_note(nid: str, payload: AssignIn):
-    """Convenience: assign a note to a handle. Writes an 'assigned' event
-    AND updates notes.assignee_handle + assignee_handle_set_at atomically.
-    Single DM to the new assignee."""
-    if not payload.handle.strip():
-        raise HTTPException(400, "handle required")
+    """Assign a note to a handle, OR unassign by passing null/empty handle.
+    Writes an 'assigned' event AND updates notes.assignee_handle +
+    assignee_handle_set_at atomically. DM fires to the new assignee
+    (skipped on unassign — no target)."""
+    target_handle = (payload.handle or "").strip() or None  # treat empty string same as null
     author = _validate_author_handle(payload.author_handle)
     ts = now_ms()
     with db() as c:
         existing = _fetch_note(c, nid)
         c.execute(
             "UPDATE notes SET assignee_handle=?, assignee_handle_set_at=?, updated_at=? WHERE uuid=?",
-            (payload.handle.strip(), ts, ts, nid),
+            (target_handle, ts, ts, nid),
         )
         _bump_parent_folder(c, existing["folder_uuid"], ts)
-        event = _insert_event(c, nid, author, "assigned", assignee_handle=payload.handle.strip())
+        event = _insert_event(c, nid, author, "assigned", assignee_handle=target_handle)
         row = c.execute("SELECT * FROM notes WHERE uuid=?", (nid,)).fetchone()
     _fan_out_event(event, row)
     return _row_to_note(row)

@@ -311,7 +311,20 @@ class FolderOut(FolderIn):
 
 
 class NoteOut(NoteIn):
-    pass
+    # AI-generated metadata. Optional on the wire because:
+    #  - notes from before the migration may have all-NULL columns
+    #  - in-flight notes show ai_status='pending'/'streaming' with title or
+    #    summary already populated but tldr/keypoints/tags still null
+    # iOS / other clients can use Codable-style optional decoding to render
+    # the fields as they arrive across progressive /sync/changes pulls.
+    ai_title: Optional[str] = None
+    ai_summary: Optional[str] = None
+    ai_tldr: Optional[str] = None
+    ai_keypoints: Optional[list[str]] = None
+    ai_tags: Optional[list[str]] = None
+    ai_status: Optional[str] = None
+    ai_generated_at: Optional[int] = None
+    ai_model: Optional[str] = None
 
 
 class PushIn(BaseModel):
